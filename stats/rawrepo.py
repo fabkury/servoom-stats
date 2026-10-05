@@ -70,6 +70,7 @@ def clone_state(branch: str) -> Path:
     path = WORK / branch
     if path.exists():
         _rmtree(path)
+    WORK.mkdir(parents=True, exist_ok=True)
     r = subprocess.run(["git", "clone", "-q", "--depth", "1", "--single-branch", "--branch", branch, URL, str(path)],
                        cwd=WORK, capture_output=True, text=True)
     if r.returncode != 0:                       # first run: the branch does not exist yet
