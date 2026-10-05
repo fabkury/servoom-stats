@@ -1,0 +1,4 @@
+_raw/
+_issues/
+__pycache__/
+*.pyc

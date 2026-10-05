@@ -1,0 +1,4 @@
+{
+  "note": "Account id ranges treated as automated. [lo, hi, parity]: parity 0 = even ids only, 1 = odd only, -1 = all.",
+  "ranges": [[400971852, 400975850, 0]]
+}

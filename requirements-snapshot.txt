@@ -1,0 +1,1 @@
+servoom @ git+https://github.com/fabkury/servoom@main#subdirectory=python
