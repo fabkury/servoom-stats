@@ -166,7 +166,7 @@ def run() -> None:
         print(f"[pulse] the last pulse was {age // 60} minutes ago; nothing to do")
         return
     main = rawrepo.clone_main(["state"])
-    api = Api(rps=float(os.environ.get("PULSE_RPS", "4")), workers=4)
+    api = Api(rps=float(os.environ.get("PULSE_RPS", "6")), workers=4)
     pool, authed = Pool(main), True
     try:
         pool.acquire(api, "pulse")

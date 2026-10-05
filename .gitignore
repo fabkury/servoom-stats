@@ -2,3 +2,5 @@ _raw/
 _issues/
 __pycache__/
 *.pyc
+.wrangler/
+node_modules/
