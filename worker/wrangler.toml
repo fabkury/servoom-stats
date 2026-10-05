@@ -1,0 +1,15 @@
+# A timer that starts the servoom-stats workflows on time. GitHub's own schedule for
+# Actions is often late or dropped, so the workflows keep it only as a fallback.
+name = "servoom-stats-trigger"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+workers_dev = false
+
+[triggers]
+crons = ["17 * * * *", "43 5 * * *"]
+
+[vars]
+REPO = "fabkury/servoom-stats"
+
+# Secret, set once with `npx wrangler secret put GITHUB_TOKEN`: a fine-grained personal
+# access token limited to this repository with the permission "Actions: read and write".

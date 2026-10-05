@@ -2,7 +2,10 @@ name: pulse
 
 on:
   schedule:
-    - cron: '17 * * * *'
+    # Fallback only: a Cloudflare Worker starts this workflow at :17 every hour (worker/).
+    # GitHub's own schedule is often late or dropped; a run within 40 minutes of the
+    # previous pulse exits at once.
+    - cron: '32,52 * * * *'
   workflow_dispatch:
     inputs:
       refresh:

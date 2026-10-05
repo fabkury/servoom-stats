@@ -23,6 +23,8 @@ from .util import (ALL_SIZES, CATEGORIES, DAY, PHOTO, SIZES, add_rollup, env_fla
 pd.set_option("future.no_silent_downcasting", True)
 WINDOW_DAYS = int(os.environ.get("PULSE_DAYS", "30"))
 AGE_BANDS = [0, 1, 3, 7, 14, 31]
+MIN_GAP = 40 * 60              # a pulse is skipped when the previous one is younger than this
+REFRESH_EVERY = 3.75 * 3600    # the site data is rebuilt by the first pulse after this long
 POPULAR_CATS = [3, 6, 8, 12, 1, 4]
 CARRY = ["first_seen", "t_new", "t_rec", "lp", "la", "cmt_ref", "miss"]
 
@@ -30,7 +32,9 @@ CARRY = ["first_seen", "t_new", "t_rec", "lp", "la", "cmt_ref", "miss"]
 def crawl_window(api: Api, st: Path, t: int, cutoff: int):
     lists_file = st / "lists.json"
     known = json.loads(lists_file.read_text()) if lists_file.exists() else {}
-    probe_all = not known or time.gmtime(t).tm_hour == 2
+    probe_all = t - known.get("_probed", 0) > 23 * 3600          # first run, then once a day
+    if probe_all:
+        known["_probed"] = t
     records = []
     for cls in CATEGORIES:
         for size in ALL_SIZES:
@@ -153,8 +157,15 @@ def run() -> None:
     t = now()
     hour = t // 3600 * 3600
     cutoff = t - WINDOW_DAYS * DAY
-    main = rawrepo.clone_main(["state"])
     st = rawrepo.clone_state("state-pulse")
+    # Several triggers aim at every hour (an outside timer, plus GitHub's own schedule as
+    # a fallback) because any one of them can be late or dropped. Only the first does work.
+    lp = st / "last_pulse.json"
+    age = t - json.loads(lp.read_text())["t"] if lp.exists() else None
+    if age is not None and age < MIN_GAP and not (env_flag("FORCE_PULSE") or env_flag("FORCE_REFRESH")):
+        print(f"[pulse] the last pulse was {age // 60} minutes ago; nothing to do")
+        return
+    main = rawrepo.clone_main(["state"])
     api = Api(rps=float(os.environ.get("PULSE_RPS", "4")), workers=4)
     pool, authed = Pool(main), True
     try:
@@ -282,8 +293,9 @@ def run() -> None:
     (st / "last_pulse.json").write_text(json.dumps(meta))
     print(f"[pulse] {meta}")
 
-    hour_utc = time.gmtime(t).tm_hour
-    if hour_utc % 4 == 1 or env_flag("FORCE_REFRESH") or bootstrap:
+    lr = st / "last_refresh.json"
+    refresh_age = t - json.loads(lr.read_text())["t"] if lr.exists() else None
+    if refresh_age is None or refresh_age > REFRESH_EVERY or env_flag("FORCE_REFRESH") or bootstrap:
         try:
             refresh.run(api, st, main, win, t, authed)
         except Exception as exc:  # a failed refresh must not lose the pulse
