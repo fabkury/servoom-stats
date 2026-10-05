@@ -61,6 +61,53 @@ def crawl(api: Api, col: Collector) -> pd.DataFrame:
     return df[df.priv == 0].drop(columns=["priv"]).reset_index(drop=True)
 
 
+CHECKPOINT_MAX_AGE = 6 * 3600
+
+
+def save_checkpoint(cur: pd.DataFrame, col: Collector, branch: str = "state-crawl") -> None:
+    """Keep the finished crawl in the private repository, so a failure in the processing
+    that follows does not cost another three-hour read of the catalog."""
+    try:
+        ck = rawrepo.clone_state(branch)
+        for f in ck.iterdir():
+            if f.name != ".git":
+                f.unlink()
+        write_parquet(cur, ck / "crawl.parquet")
+        write_parquet(pd.DataFrame([(u, *v) for u, v in col.users.items()], columns=["uid", "name", "cc", "level", "amb", "head"]), ck / "users.parquet")
+        write_parquet(pd.DataFrame(col.meta, columns=["gid", "uid", "date", "tags", "at"]), ck / "meta.parquet")
+        (ck / "fids.json").write_text(json.dumps(col.fids))
+        (ck / "info.json").write_text(json.dumps({"t": col.t, "rows": int(len(cur))}))
+        rawrepo.push_state(branch, f"crawl checkpoint {day_of(col.t)}")
+        print(f"[snapshot] crawl checkpoint saved, {len(cur)} rows")
+    except Exception as exc:                 # a checkpoint is a convenience; never fail the run for it
+        print(f"[snapshot] could not save the crawl checkpoint: {exc!r}")
+
+
+def load_checkpoint(now_t: int, last_t: int, branch: str = "state-crawl"):
+    """A saved crawl that is recent and was not yet turned into a snapshot, or None."""
+    try:
+        ck = rawrepo.clone_state(branch)
+        info_file = ck / "info.json"
+        if not info_file.exists():
+            return None
+        info = json.loads(info_file.read_text())
+        if now_t - info["t"] > CHECKPOINT_MAX_AGE or info["t"] <= last_t:
+            return None
+        cur = pd.read_parquet(ck / "crawl.parquet")
+        if len(cur) != info["rows"]:
+            return None
+        col = Collector(info["t"])
+        u = pd.read_parquet(ck / "users.parquet")
+        col.users = {r[0]: tuple(r[1:]) for r in u.itertuples(index=False, name=None)}
+        col.fids = {int(k): v for k, v in json.loads((ck / "fids.json").read_text()).items()}
+        mt = pd.read_parquet(ck / "meta.parquet")
+        col.meta = [(g, uid, d, list(tags), [int(x) for x in at]) for g, uid, d, tags, at in mt.itertuples(index=False, name=None)]
+        return cur, col, info["t"]
+    except Exception as exc:
+        print(f"[snapshot] crawl checkpoint not usable: {exc!r}")
+        return None
+
+
 def pulse_events(main: Path, since: int) -> pd.DataFrame:
     parts = [pd.read_parquet(p) for p in (main / "obs" / "pulse").rglob("*-likes.parquet")]
     ev = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["gid", "liker", "t", "t_prev", "auto"])
@@ -312,9 +359,16 @@ def run() -> None:
     rawrepo.push_main("snapshot: account state")       # token and strikes, before the long crawl
 
     since = last.get("t", 0)
-    col = Collector(t)
-    cur = crawl(api, col)
     partial = bool(os.environ.get("LIMIT_LISTS"))
+    saved = None if partial or env_flag("NO_CHECKPOINT") else load_checkpoint(t, since)
+    if saved:
+        cur, col, t = saved            # the snapshot is dated at the time of the crawl it reuses
+        print(f"[snapshot] reusing the crawl of {time.strftime('%Y-%m-%d %H:%M', time.gmtime(t))} UTC, {len(cur)} rows")
+    else:
+        col = Collector(t)
+        cur = crawl(api, col)
+        if not partial:
+            save_checkpoint(cur, col)
     prev = read_parquet(st / "catalog.parquet")
     bootstrap = prev is None
     if bootstrap:
