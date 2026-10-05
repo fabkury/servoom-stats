@@ -27,6 +27,8 @@ jobs:
           python-version: '3.12'
           cache: pip
       - run: pip install -q -r requirements.txt -r requirements-snapshot.txt
+      - name: Check the decoders import
+        run: python -c "from servoom import PixelBeanDecoder; print('decoders ok')"
       - name: Poll
         env:
           RAW_REPO_DEPLOY_KEY: ${{ secrets.RAW_REPO_DEPLOY_KEY }}

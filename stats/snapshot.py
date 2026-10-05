@@ -293,7 +293,13 @@ def run() -> None:
     st = rawrepo.clone_state("state-snap")
     days = [time.strftime("%Y/%m/%d", time.gmtime(t - k * DAY)) for k in range(3)]
     main = rawrepo.clone_main(["state"] + [f"obs/pulse/{d}" for d in days])
-    api = Api(rps=float(os.environ.get("SNAPSHOT_RPS", "8")), workers=8)
+    lastf = st / "last_snapshot.json"
+    last = json.loads(lastf.read_text()) if lastf.exists() else {}
+    if t - last.get("t", 0) < 12 * 3600 and not env_flag("FORCE_SNAPSHOT"):
+        print("[snapshot] the last snapshot is less than 12 hours old; nothing to do")
+        return
+    # Deep pages answer slowly, so many workers are needed to reach the request rate.
+    api = Api(rps=float(os.environ.get("SNAPSHOT_RPS", "8")), workers=24)
     try:
         Pool(main).acquire(api, "snapshot")
     except Halted as exc:
@@ -303,8 +309,6 @@ def run() -> None:
         return
     rawrepo.push_main("snapshot: account state")       # token and strikes, before the long crawl
 
-    lastf = st / "last_snapshot.json"
-    last = json.loads(lastf.read_text()) if lastf.exists() else {}
     since = last.get("t", 0)
     col = Collector(t)
     cur = crawl(api, col)
@@ -407,7 +411,7 @@ def run() -> None:
     # daily rollup of flows
     m["tier"] = tier(m)
     m["photo"] = (m.cls == PHOTO).astype("int8")
-    m["ab"] = pd.cut(age, AGE, right=False, labels=False).astype("int8")
+    m["ab"] = pd.cut(age.clip(0, 9e5), AGE, right=False, labels=False).astype("int8")   # a few records carry a future date
     live = m[~m.isnew | fresh].assign(n=1, day=day_of(t), dt=lambda x: t - x.t_p)
     if not bootstrap:
         add_rollup(st / "daily.parquet", live.groupby(["day", "size", "tier", "photo", "ab"], as_index=False)[

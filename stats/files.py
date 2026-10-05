@@ -11,7 +11,8 @@ from PIL import Image
 
 try:                                    # the decoders live in the servoom package
     from servoom import PixelBeanDecoder
-except Exception:                       # pragma: no cover - reported once by the caller
+except Exception as exc:                # pragma: no cover - reported once by the caller
+    print(f"[files] cannot import the servoom decoders: {exc!r}")
     PixelBeanDecoder = None
 
 

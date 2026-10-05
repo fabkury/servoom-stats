@@ -47,7 +47,7 @@ def build(st: Path, cat: pd.DataFrame, users: pd.DataFrame, acc, meta: pd.DataFr
     t, since = ctx["t"], ctx["since"]
     today = day_of(t)
     live = cat[cat.gone == 0]
-    live = live.assign(tier=tier(live), photo=(live.cls == PHOTO).astype(int), age=(t - live.date) / DAY)
+    live = live.assign(tier=tier(live), photo=(live.cls == PHOTO).astype(int), age=((t - live.date) / DAY).clip(lower=0))
     year = live[live.age <= 365]
     top = ctx["top"]
     topset = set(top.uid)
