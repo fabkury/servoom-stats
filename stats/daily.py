@@ -109,15 +109,23 @@ def build(st: Path, cat: pd.DataFrame, users: pd.DataFrame, acc, meta: pd.DataFr
     gone_today = cat[(cat.gone == 1) & (cat.t_gone == t)]
     for k, v in gone_today.gone_kind.value_counts().items():
         put("vanished", int(v), k)
+    put("span_days", (t - since) / DAY if since else None)
     series = read_parquet(st / "series.parquet")
     new = pd.DataFrame(S, columns=["day", "metric", "key", "value"])
     if not ctx["partial"] or series is None:
         series = new if series is None else pd.concat([series[series.day != today], new], ignore_index=True)
         write_parquet(series, st / "series.parquet")
 
-    def ser(metric):
+    # Days each snapshot covers. After a skipped day one reading holds two days of activity;
+    # rows that count such activity carry ``days`` so the site can spread them.
+    span = series[series.metric == "span_days"].set_index("day").value
+
+    def ser(metric, flow=False):
         x = series[series.metric == metric]
-        return recs(x.pivot_table(index="day", columns="key", values="value").reset_index()) if len(x) else []
+        if not len(x):
+            return []
+        x = x.pivot_table(index="day", columns="key", values="value").reset_index()
+        return recs(x.assign(days=x.day.map(span)) if flow else x)
 
     # ---- daily flows -------------------------------------------------------
     dly = read_parquet(st / "daily.parquet")
@@ -171,7 +179,7 @@ def build(st: Path, cat: pd.DataFrame, users: pd.DataFrame, acc, meta: pd.DataFr
         c["category"] = c.cls.map(CAT_NAME)
         res = {"by_month": recs(g), "by_category": recs(c.dropna(subset=["category"])[["category", "n", "new", "rec"]])}
         if dly is not None and len(dly):
-            res["per_day"] = recs(dly.groupby("day", as_index=False)[["to_rec", "to_new", "refiled"]].sum())
+            res["per_day"] = recs(dly.groupby("day", as_index=False)[["to_rec", "to_new", "refiled"]].sum().assign(days=lambda d: d.day.map(span)))
         return res
     part("curation", curation)
 
@@ -187,7 +195,7 @@ def build(st: Path, cat: pd.DataFrame, users: pd.DataFrame, acc, meta: pd.DataFr
                 rows.append({"days": d, "n": int(len(el)), "gone": float(goneby.mean()),
                              **{k: float(((el.gone_kind == k) & goneby).mean()) for k in ("removed", "made private", "hidden", "no record")}})
         res["by_age"] = rows
-        res["per_day"] = ser("vanished")
+        res["per_day"] = ser("vanished", flow=True)
         return res
     part("survival", survival)
 
@@ -233,7 +241,7 @@ def build(st: Path, cat: pd.DataFrame, users: pd.DataFrame, acc, meta: pd.DataFr
     part("funnel", funnel)
 
     def audience():
-        res = {"likers": ser("likers"), "new_likers": ser("likers_new"), "returning": ser("likers_returning_share"),
+        res = {"likers": ser("likers"), "new_likers": ser("likers_new", flow=True), "returning": ser("likers_returning_share"),
                "uploader_share": ser("likers_uploader_share"), "likes_by_uploaders": ser("likes_by_uploaders_share"),
                "top1pct": ser("likes_top1pct_likers_share"), "reciprocity": ser("reciprocity_30d"),
                "automated_accounts": ser("auto_accounts_30d")}
@@ -342,7 +350,7 @@ def build(st: Path, cat: pd.DataFrame, users: pd.DataFrame, acc, meta: pd.DataFr
             h = hist[hist.uid == uid] if hist is not None else None
             write_json(f"artists/{int(uid)}.json", {
                 "id": int(uid), "months": recs(g.drop(columns=["uid"])),
-                "daily": recs(h[["day", "fans", "score", "level", "up_day", "dl_day", "dlp_day", "dv_day"]]) if h is not None and len(h) else []}, SUB)
+                "daily": recs(h[["day", "fans", "score", "level", "up_day", "dl_day", "dlp_day", "dv_day"]].assign(days=h.day.map(span))) if h is not None and len(h) else []}, SUB)
         for f in adir.glob("*.json"):
             if f.stem != "index" and int(f.stem) not in topset:
                 f.unlink()
