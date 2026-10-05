@@ -138,12 +138,15 @@ def process_files(api: Api, st: Path, new: pd.DataFrame, fids: dict, t: int) -> 
         print("[snapshot] servoom decoders not importable; files skipped")
         return pd.DataFrame()
 
-    def one(row):
-        data = api.get_file(fids[row.gid]) if fids.get(row.gid) else None
+    # Download in parallel, decode here: the LZO decoder must stay on the thread that made it.
+    rows = list(todo.itertuples())
+    blobs = api.pmap(lambda row: api.get_file(fids[row.gid]) if fids.get(row.gid) else None, rows)
+    feats = []
+    for row, data in zip(rows, blobs):
         f = files.features(data) if data else None
-        return None if f is None else {"gid": row.gid, "uid": row.uid, "size": row.size, "date": row.date, "ftype": row.ftype,
-                                       "layer": row.layer, "music": row.music, **f}
-    feats = [f for f in api.pmap(one, list(todo.itertuples())) if f]
+        if f is not None:
+            feats.append({"gid": row.gid, "uid": row.uid, "size": row.size, "date": row.date, "ftype": row.ftype,
+                          "layer": row.layer, "music": row.music, **f})
     if not feats:
         return pd.DataFrame()
     fd = pd.DataFrame(feats).sort_values("date")
@@ -224,10 +227,9 @@ def profiles(api: Api, st: Path, top: pd.DataFrame, cat: pd.DataFrame, m: pd.Dat
     out_dir.mkdir(parents=True, exist_ok=True)
     todo = [r for r in p.itertuples() if r.head and (known.get(str(r.uid)) != r.head or not (out_dir / f"{r.uid}.webp").exists())]
 
-    def avatar(r):
-        data = api.get_file(r.head)
-        return r, (files.avatar_webp(data) if data else None)
-    for r, webp in api.pmap(avatar, todo[:1500]):
+    todo = todo[:1500]
+    for r, data in zip(todo, api.pmap(lambda r: api.get_file(r.head), todo)):
+        webp = files.avatar_webp(data) if data else None
         if webp:
             (out_dir / f"{r.uid}.webp").write_bytes(webp)
         known[str(r.uid)] = r.head
