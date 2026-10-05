@@ -14,11 +14,24 @@ build downloads `data/` from here. The design is documented in
 
 | Job | When | What it does |
 |-----|------|--------------|
-| `pulse` | hourly | Reads every upload of the past 30 days, new artwork ids, the Popular ordering, and who gave each new like. About 550 requests. |
+| `pulse` | hourly | Reads every upload of the past 30 days, new artwork ids, the Popular ordering, and who gave each new like. About 700 requests; once a day about 4,500, when every list is read with a long look-ahead. |
 | refresh | every 4 hours, inside the pulse | Adds new-account sampling, new comments and category totals, then rebuilds `data/pulse/`. |
 | `snapshot` | daily | Reads the whole public catalog (about 1.5 million artworks), new files, vanished artworks and featured-artist profiles, then rebuilds `data/daily/`. About 66,000 requests, roughly 2.5 hours. |
 
 Each job commits `data/` when it changed and asks Cloudflare to rebuild the site.
+
+## What starts the jobs
+
+GitHub's own schedule for Actions proved unreliable (one scheduled run in the first eight
+hours), so a small Cloudflare Worker in [`worker/`](worker/) starts the workflows through
+the `workflow_dispatch` API: the pulse at :17 every hour and the snapshot at 05:43 UTC.
+The workflows keep cron lines at other minutes as a fallback. A pulse exits at once when
+the previous one is under 40 minutes old, and a snapshot when the previous one is under
+12 hours old, so extra triggers cost a few seconds.
+
+The Worker holds one secret, `GITHUB_TOKEN`: a fine-grained personal access token limited
+to this repository with the permission "Actions: read and write". Deploy with
+`npx wrangler deploy` from `worker/`; set the secret with `npx wrangler secret put GITHUB_TOKEN`.
 
 The collector only sends read commands (`stats/api.py` keeps the list) and never likes,
 views or uploads anything.
