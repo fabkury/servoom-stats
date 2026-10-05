@@ -37,11 +37,12 @@ def crawl_window(api: Api, st: Path, t: int, cutoff: int):
             key = f"{cls}_{size}"
             if not probe_all and key not in known:
                 continue
-            # Lists with a block of old artworks near the top need a longer look-ahead.
-            # Unknown lists, and every list once a day, are read with the long one.
-            long = probe_all or known.get(key, {}).get("block", True)
-            fl = api.crawl_list(cls, size, stop_before=cutoff, old_streak=5 if long else 2)
-            block = api.last_gap if long else False
+            # Lists are not strictly newest-first: at times a long run of much older
+            # artworks sits right after the newest 60. Once a day every list is read
+            # with a long look-ahead; the hourly reads rely on the newest pages plus
+            # the per-artwork refresh in refresh_missing().
+            fl = api.crawl_list(cls, size, stop_before=cutoff, old_streak=16 if probe_all else 2)
+            block = api.last_gap if probe_all else known.get(key, {}).get("block", False)
             fl = [x for x in fl if x["Date"] >= cutoff]
             if fl:
                 known[key] = {"n": len(fl), "t": t, "block": block}
@@ -50,6 +51,25 @@ def crawl_window(api: Api, st: Path, t: int, cutoff: int):
             records.extend(fl)
     lists_file.write_text(json.dumps(known))
     return records
+
+
+def refresh_missing(api: Api, cur: pd.DataFrame, prev: pd.DataFrame, t: int, cutoff: int) -> pd.DataFrame:
+    """Re-read, one by one, window artworks that the listings did not return this hour.
+
+    A listing can temporarily leave out artworks that still exist. Their counters are
+    read with Cloud/GalleryInfo so the hourly series has no holes; what the record
+    lacks (category, canvas size, curation flags) is carried over from the last reading.
+    """
+    miss = prev[~prev.gid.isin(cur.gid) & (prev.date >= cutoff)].sort_values("date", ascending=False).head(2500)
+    rows = []
+    for row, r in zip(miss.to_dict("records"), api.pmap(api.gallery_info, miss.gid.tolist())):
+        if r.get("ReturnCode") != 0 or int(r.get("PrivateFlag") or 0) or int(r.get("IsDel") or 0):
+            continue
+        d = {c: row[c] for c in cur.columns}
+        d.update(like=int(r.get("LikeCnt") or 0), watch=int(r.get("WatchCnt") or 0), cmt=int(r.get("CommentCnt") or 0),
+                 likeutc=int(r.get("LikeUTC") or 0), cmtutc=int(r.get("CommentUTC") or 0), t=t)
+        rows.append(d)
+    return pd.concat([cur, pd.DataFrame(rows, columns=cur.columns).astype("int64")], ignore_index=True) if rows else cur
 
 
 def crawl_feeds(api: Api, cutoff: int):
@@ -151,6 +171,9 @@ def run() -> None:
     bootstrap = prev is None
     if bootstrap:
         prev = pd.DataFrame(columns=list(cur.columns) + CARRY)
+    n_listed = len(cur)
+    if authed and not bootstrap:
+        cur = refresh_missing(api, cur, prev, t, cutoff)
     p = prev[["gid", "like", "watch", "cmt", "new", "rec", "t"] + CARRY].add_suffix("_p").rename(columns={"gid_p": "gid"})
     d = cur.merge(p, on="gid", how="left")
     isnew = d.like_p.isna()
@@ -255,7 +278,7 @@ def run() -> None:
     win = pd.concat([d[keep], gone[keep]], ignore_index=True)
     write_parquet(win, st / "window.parquet")
     meta = {"t": t, "mode": "normal" if authed else "degraded", "requests": api.n_requests,
-            "n_window": int(len(d)), "window_days": WINDOW_DAYS, "bootstrap": bootstrap}
+            "n_window": int(len(d)), "n_listed": int(n_listed), "window_days": WINDOW_DAYS, "bootstrap": bootstrap}
     (st / "last_pulse.json").write_text(json.dumps(meta))
     print(f"[pulse] {meta}")
 

@@ -117,7 +117,7 @@ def check_vanished(api: Api, cat: pd.DataFrame, seen: set, t: int) -> pd.DataFra
         elif int(r.get("HideFlag") or 0):
             kind = "hidden"
         else:
-            kind = "unlisted"
+            continue          # still public: a listing left it out for now, it is not gone
         rows.append((gid, kind))
     v = pd.DataFrame(rows, columns=["gid", "kind"])
     if len(v):
