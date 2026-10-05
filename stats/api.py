@@ -102,14 +102,19 @@ class Api:
         return r.get("FileList") or []
 
     def crawl_list(self, classify: int, size: int, stop_before: Optional[int] = None,
-                   max_pages: Optional[int] = None, transform: Optional[Callable] = None) -> List:
-        """Page one (category, size) list, newest first, in parallel waves.
+                   max_pages: Optional[int] = None, transform: Optional[Callable] = None,
+                   old_streak: int = 2) -> List:
+        """Page one (category, size) list in parallel waves.
 
-        Stops at the first empty page, or once a page holds nothing dated at or after
-        ``stop_before``.
+        Lists are newest-first, but not strictly: some carry a block of about 120 much
+        older artworks right after the first 60. So with ``stop_before`` the crawl ends
+        only after ``old_streak`` consecutive pages hold nothing dated at or after it
+        (5 pages clear such a block). Without it, it ends at the first empty page.
+        ``self.last_gap`` tells whether an old page was followed by a newer one.
         """
-        out: List[Dict] = []
-        page, wave = 0, 2
+        out: List = []
+        page, wave, streak, seen_old = 0, max(2, old_streak), 0, False
+        self.last_gap = False
         while True:
             if max_pages is not None:
                 wave = min(wave, max_pages - page)
@@ -119,12 +124,20 @@ class Api:
                               range(page, page + wave))
             done = False
             for fl in pages:
+                if done:
+                    break
                 if not fl:
                     done = True
                     continue
                 out.extend(fl if transform is None else [transform(x) for x in fl])
-                if stop_before is not None and max(x["Date"] for x in fl) < stop_before:
-                    done = True
+                if stop_before is not None:
+                    if max(x["Date"] for x in fl) < stop_before:
+                        streak += 1
+                        seen_old = True
+                        done = streak >= old_streak
+                    else:
+                        self.last_gap = self.last_gap or seen_old
+                        streak = 0
             if done:
                 break
             page += wave

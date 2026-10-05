@@ -37,10 +37,14 @@ def crawl_window(api: Api, st: Path, t: int, cutoff: int):
             key = f"{cls}_{size}"
             if not probe_all and key not in known:
                 continue
-            fl = api.crawl_list(cls, size, stop_before=cutoff)
+            # Lists with a block of old artworks near the top need a longer look-ahead.
+            # Unknown lists, and every list once a day, are read with the long one.
+            long = probe_all or known.get(key, {}).get("block", True)
+            fl = api.crawl_list(cls, size, stop_before=cutoff, old_streak=5 if long else 2)
+            block = api.last_gap if long else False
             fl = [x for x in fl if x["Date"] >= cutoff]
             if fl:
-                known[key] = {"n": len(fl), "t": t}
+                known[key] = {"n": len(fl), "t": t, "block": block}
             elif key in known and t - known[key]["t"] > 40 * DAY:
                 del known[key]
             records.extend(fl)
