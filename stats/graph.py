@@ -39,7 +39,7 @@ MIN_COMMUNITY = 20
 TARGET_MEDIAN = 150
 GRID = [0.5, 0.7, 1.0, 1.5, 2.0, 3.0, 4.0]
 MAX_LARGEST = 0.15
-EMBED_DIM = 32
+TARGET_WEIGHT = 0.3
 SEED = 7
 TOP_N = 20                      # neighbours listed per top artist
 
@@ -181,16 +181,16 @@ def match_labels(nodes: List[int], m: np.ndarray, prev: Optional[pd.DataFrame]) 
 # 3. Map
 # ---------------------------------------------------------------------------
 
-def embed(g: ig.Graph, prev_pos: Optional[pd.DataFrame]) -> np.ndarray:
+def embed(g: ig.Graph, raw: np.ndarray, prev_pos: Optional[pd.DataFrame]) -> np.ndarray:
+    """2D map: UMAP (cosine) on the rows of the normalised adjacency, lightly supervised by
+    the Leiden labels (target_weight TARGET_WEIGHT) so communities form readable blobs
+    while neighbours stay near each other. A plain spectral embedding gave a thin curve on
+    2026-10-06. Yesterday's positions seed the layout so the map drifts, not jumps."""
     import umap  # slow import, kept local
     n = g.vcount()
     src = np.array([e.source for e in g.es]); dst = np.array([e.target for e in g.es])
-    A = sp.coo_matrix((np.array(g.es["w"]), (src, dst)), shape=(n, n))
+    A = sp.coo_matrix((np.array(g.es["wn"]), (src, dst)), shape=(n, n))
     A = (A + A.T).tocsr()
-    d = np.asarray(A.sum(1)).ravel()
-    Dm = sp.diags(1 / np.sqrt(np.maximum(d, 1e-9)))
-    k = min(EMBED_DIM, n - 2)
-    _, vecs = sla.eigsh(Dm @ A @ Dm, k=k, which="LA")
     init: object = "spectral"
     if prev_pos is not None and not prev_pos.empty:
         pp = dict(zip(prev_pos.uid, zip(prev_pos.x, prev_pos.y)))
@@ -198,15 +198,15 @@ def embed(g: ig.Graph, prev_pos: Optional[pd.DataFrame]) -> np.ndarray:
         pos = np.array([pp.get(u, (np.nan, np.nan)) for u in uids], dtype="float64")
         known = ~np.isnan(pos[:, 0])
         if known.sum() >= 0.5 * n:
-            # new nodes start at the mean position of their known neighbours, else the centre
             adj = A.tolil()
             centre = np.nanmean(pos, axis=0)
             for i in np.flatnonzero(~known):
                 nb = [j for j in adj.rows[i] if known[j]]
                 pos[i] = pos[nb].mean(axis=0) if nb else centre
             init = pos + np.random.default_rng(SEED).normal(0, 1e-3, pos.shape)
-    reducer = umap.UMAP(n_components=2, n_neighbors=15, min_dist=0.1, random_state=SEED, init=init)
-    xy = reducer.fit_transform(vecs)
+    reducer = umap.UMAP(n_components=2, metric="cosine", n_neighbors=20, min_dist=0.05, random_state=SEED,
+                        init=init, target_weight=TARGET_WEIGHT)
+    xy = reducer.fit_transform(A, y=raw)
     xy = (xy - xy.mean(axis=0)) / (xy.std(axis=0).max() + 1e-9)
     return xy.astype("float32")
 
@@ -337,7 +337,7 @@ def history(ev: pd.DataFrame, node_comm: pd.Series, cat: pd.DataFrame, t: int) -
     return out
 
 
-def ego(uid: int, pairs: pd.DataFrame, ev: pd.DataFrame, node_comm: pd.Series, top: set, t: int) -> Dict:
+def ego(uid: int, pairs: pd.DataFrame, ev: pd.DataFrame, allev: pd.DataFrame, node_comm: pd.Series, top: set, t: int) -> Dict:
     def side(df: pd.DataFrame, col: str) -> List[Dict]:
         s = df.sort_values("n", ascending=False).head(TOP_N)
         return [{"id": int(x) if x in top else None, "comm": int(node_comm.get(x, 0)), "likes": int(n)}
@@ -348,7 +348,7 @@ def ego(uid: int, pairs: pd.DataFrame, ev: pd.DataFrame, node_comm: pd.Series, t
     e["month"] = pd.to_datetime(e.time, unit="s").dt.strftime("%Y-%m")
     e["given"] = (e.liker == uid).astype(int); e["received"] = (e.uid == uid).astype(int)
     months = e.groupby("month")[["given", "received"]].sum().astype(int).to_dict("index")
-    aud = ev[(ev.uid == uid) & ~ev.liker.isin(node_comm.index)]
+    aud = allev[(allev.uid == uid) & ~allev.liker.isin(node_comm.index)]
     return {"id": int(uid), "comm": int(node_comm.get(uid, 0)),
             "out_degree": int(len(out_p)), "in_degree": int(len(in_p)), "mutual": len(mutual),
             "likes_given": int(out_p.n.sum()), "likes_received": int(in_p.n.sum()),
@@ -401,7 +401,7 @@ def run() -> None:
     log(f"communities: {int((s[1:] > 0).sum())} with >= {MIN_COMMUNITY} members, {int(s[0])} artists in small groups, "
         f"kept {minfo['kept']} ids, {minfo['new']} new, stability {minfo['stability']}")
 
-    xy = embed(g, read_parquet(st / "positions.parquet"))
+    xy = embed(g, raw, read_parquet(st / "positions.parquet"))
     log(f"map embedded in {time.time() - t0:.0f} s total so far")
     deg = np.array(g.degree())
     out_dir = DATA / SUB
@@ -422,7 +422,7 @@ def run() -> None:
     name_of = users.set_index("uid").name.to_dict()
     index = []
     for u in in_graph:
-        e = ego(u, pairs, e12, node_comm, top, t)
+        e = ego(u, pairs, e12, ev12, node_comm, top, t)
         write_json(f"artists/{u}.json", e, SUB)
         index.append({"id": u, "name": name_of.get(u, ""), "comm": e["comm"], "in": e["in_degree"], "out": e["out_degree"], "mutual": e["mutual"]})
     write_json("artists/index.json", {"schema": 1, "generated": iso(t), "artists": index}, SUB)
