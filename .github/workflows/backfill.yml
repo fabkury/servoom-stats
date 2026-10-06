@@ -1,0 +1,59 @@
+name: backfill-likes
+
+# One-time backfill of like lists for the 12 months before the pulse log began.
+# Resumable: each run continues from the checkpoint on the raw repository's
+# state-backfill branch and exits at once when the backfill is finished.
+on:
+  schedule:
+    # Fallback that finishes the job if nobody dispatches it: 10:27 UTC, after the
+    # daily snapshot (05:43 UTC, about 2.5 h) so the two never poll at the same time.
+    - cron: '27 10 * * *'
+  workflow_dispatch:
+    inputs:
+      max_minutes:
+        description: 'Stop polling after this many minutes (the partial chunk is saved)'
+        type: number
+        default: 235
+      rate:
+        description: 'Requests per second'
+        type: number
+        default: 8
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 255
+    environment: polling
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -q -r requirements.txt
+      - name: Poll
+        env:
+          RAW_REPO_DEPLOY_KEY: ${{ secrets.RAW_REPO_DEPLOY_KEY }}
+          ACCOUNT_EMAIL_DOMAIN: ${{ vars.ACCOUNT_EMAIL_DOMAIN }}
+          MAX_MINUTES: ${{ inputs.max_minutes || 235 }}
+          BACKFILL_RPS: ${{ inputs.rate || 8 }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$RAW_REPO_DEPLOY_KEY" > ~/.ssh/raw_key && chmod 600 ~/.ssh/raw_key
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/raw_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          python -m stats.backfill_likes
+      - name: Open issues
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/issues.sh
