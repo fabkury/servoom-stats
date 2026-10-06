@@ -61,7 +61,15 @@ def push_main(message: str) -> None:
         r = subprocess.run(["git", "push", "-q", "origin", "main"], cwd=path, capture_output=True, text=True)
         if r.returncode == 0:
             return
-        git("fetch", "-q", "--depth", "20", "origin", "main", cwd=path)
+        git("fetch", "-q", "--depth", "50", "origin", "main", cwd=path)
+        # A shallow clone whose base has fallen more than 50 commits behind has no merge
+        # base with origin/main; rebasing then replays the grafted root commit (the whole
+        # tree) and conflicts with every file changed upstream. This happened on
+        # 2026-10-06 when the like backfill committed every few minutes during a snapshot.
+        # Deepening to the full history is cheap: the clone is blobless.
+        if not git("merge-base", "HEAD", "origin/main", cwd=path, check=False):
+            if git("rev-parse", "--is-shallow-repository", cwd=path) == "true":
+                git("fetch", "-q", "--unshallow", "origin", "main", cwd=path)
         git("rebase", "origin/main", cwd=path)
     raise RuntimeError("could not push raw main")
 
