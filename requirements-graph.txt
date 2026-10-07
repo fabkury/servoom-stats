@@ -1,4 +1,0 @@
-igraph
-leidenalg
-umap-learn
-scipy
