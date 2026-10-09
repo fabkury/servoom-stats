@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from . import rawrepo
 from .api import Api, ApiDown
 
 EMAIL_DOMAIN = os.environ.get("ACCOUNT_EMAIL_DOMAIN", "servoom.invalid")
@@ -147,6 +148,10 @@ class Pool:
                            "It failed its health check on three runs in a row. A spare takes over.")
             self.save(a)
             if a["status"] == "ok":
+                try:                   # keep the strike: three in a row retire the account
+                    rawrepo.push_main(f"{role}: account strike")
+                except Exception as exc:
+                    print(f"[accounts] could not push the strike: {exc!r}")
                 raise ApiDown("account failed its health check; will retry next run")
         for a in spares:
             if self._try(api, a):

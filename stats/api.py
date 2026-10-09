@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -11,6 +12,14 @@ import requests
 
 HOST = "https://appin.divoom-gz.com"
 FILE_HOST = "https://f.divoom-gz.com"
+
+# A failed request is retried with backoff capped at RETRY_CAP seconds. The job gives up
+# only when the whole client has had no good answer for OUTAGE seconds, or one request
+# has failed for that long on its own. Before 2026-10-09 five attempts and a shared
+# streak of 40 failures were the limit, and a server hiccup of about a minute ended a
+# three-hour crawl.
+OUTAGE = float(os.environ.get("API_OUTAGE_SECONDS", str(15 * 60)))
+RETRY_CAP = 60.0
 
 # Commands this pipeline is allowed to send. Anything else is a programming error:
 # the collector must never call a command that changes server state.
@@ -37,7 +46,7 @@ class Api:
         self._next = 0.0
         self.auth: Dict = {}
         self.n_requests = 0
-        self._fail_streak = 0
+        self._last_ok = time.monotonic()
 
     def _wait(self) -> None:
         with self._lock:
@@ -51,8 +60,8 @@ class Api:
         if cmd not in READ_ONLY:
             raise ValueError(f"command not on the read-only list: {cmd}")
         payload = {**(self.auth if auth else {}), **(body or {})}
-        last: Optional[Exception] = None
-        for attempt in range(5):
+        t0, attempt = time.monotonic(), 0
+        while True:
             self._wait()
             try:
                 r = self.s.post(f"{HOST}/{cmd}", json=payload, timeout=30)
@@ -60,15 +69,14 @@ class Api:
                 if r.status_code >= 500:
                     raise requests.HTTPError(f"HTTP {r.status_code}")
                 data = r.json()
-                self._fail_streak = 0
+                self._last_ok = time.monotonic()
                 return data
             except (requests.RequestException, ValueError) as exc:
-                last = exc
-                self._fail_streak += 1
-                if self._fail_streak > 40:
+                t = time.monotonic()
+                if t - self._last_ok > OUTAGE or t - t0 > OUTAGE:
                     raise ApiDown(f"{cmd}: {exc}") from exc
-                time.sleep(2 ** attempt)
-        raise ApiDown(f"{cmd}: {last}")
+                attempt += 1
+                time.sleep(min(RETRY_CAP, 2.0 ** attempt))
 
     def get_file(self, file_id: str) -> Optional[bytes]:
         for attempt in range(3):

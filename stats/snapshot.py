@@ -9,6 +9,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -48,27 +49,53 @@ class Collector:
             SCRIPTS.index(script_of(x.get("FileName"))), SCRIPTS.index(script_of(x.get("Content"))))
 
 
-def crawl(api: Api, col: Collector) -> pd.DataFrame:
+def list_plan() -> list:
+    """The (category, size) lists a crawl reads, in order."""
     limit = os.environ.get("LIMIT_LISTS")
-    lists = [tuple(map(int, s.split("_"))) for s in limit.split(",")] if limit else \
+    return [tuple(map(int, s.split("_"))) for s in limit.split(",")] if limit else \
         [(c, s) for c in CATEGORIES for s in ALL_SIZES]
-    rows, t0 = [], now()
-    for i, (cls, size) in enumerate(lists):
+
+
+def crawl(api: Api, col: Collector, lists: list, seed: Optional[pd.DataFrame] = None, start: int = 0,
+          save=None) -> pd.DataFrame:
+    """Read ``lists[start:]``; ``seed`` holds the raw rows of the lists before ``start``.
+
+    With ``save``, the raw rows read so far are checkpointed every CHECKPOINT_EVERY
+    seconds, so a run that dies (the first list alone takes over an hour) can resume.
+    """
+    frames = [seed] if seed is not None and len(seed) else []
+    rows, t0, t_save = [], now(), now()
+    for i in range(start, len(lists)):
+        cls, size = lists[i]
         rows += api.crawl_list(cls, size, transform=col.take)
         if i % 20 == 0:
-            print(f"[snapshot] list {i}/{len(lists)}, {len(rows)} rows, {api.n_requests} requests, {now() - t0}s", flush=True)
-    df = pd.DataFrame(rows, columns=INT).drop_duplicates("gid")
+            print(f"[snapshot] list {i}/{len(lists)}, {len(rows) + sum(map(len, frames))} rows, "
+                  f"{api.n_requests} requests, {now() - t0}s", flush=True)
+        if save is not None and i + 1 < len(lists) and now() - t_save >= CHECKPOINT_EVERY:
+            if rows:
+                frames.append(pd.DataFrame(rows, columns=INT))
+                rows = []
+            save(pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(rows, columns=INT),
+                 col, i + 1, len(lists))
+            t_save = now()
+    if rows:                               # empty frames are left out so the int columns keep their dtype
+        frames.append(pd.DataFrame(rows, columns=INT))
+    df = (pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(rows, columns=INT)).drop_duplicates("gid")
     return df[df.priv == 0].drop(columns=["priv"]).reset_index(drop=True)
 
 
 CHECKPOINT_MAX_AGE = 6 * 3600
+CHECKPOINT_EVERY = 20 * 60
 
 
-def save_checkpoint(cur: pd.DataFrame, col: Collector, branch: str = "state-crawl") -> None:
-    """Keep the finished crawl in the private repository, so a failure in the processing
-    that follows does not cost another three-hour read of the catalog."""
+def save_checkpoint(cur: pd.DataFrame, col: Collector, done: int, total: int, branch: str = "state-crawl") -> None:
+    """Keep the crawl in the private repository: the raw rows of the first ``done`` of
+    ``total`` lists while it runs, the finished table at the end. A run that dies resumes
+    from it instead of reading the catalog again for three hours."""
     try:
-        ck = rawrepo.clone_state(branch)
+        ck = rawrepo.WORK / branch
+        if not ck.exists():
+            ck = rawrepo.clone_state(branch)
         for f in ck.iterdir():
             if f.name != ".git":
                 f.unlink()
@@ -76,15 +103,17 @@ def save_checkpoint(cur: pd.DataFrame, col: Collector, branch: str = "state-craw
         write_parquet(pd.DataFrame([(u, *v) for u, v in col.users.items()], columns=["uid", "name", "cc", "level", "amb", "head"]), ck / "users.parquet")
         write_parquet(pd.DataFrame(col.meta, columns=["gid", "uid", "date", "tags", "at"]), ck / "meta.parquet")
         (ck / "fids.json").write_text(json.dumps(col.fids))
-        (ck / "info.json").write_text(json.dumps({"t": col.t, "rows": int(len(cur))}))
-        rawrepo.push_state(branch, f"crawl checkpoint {day_of(col.t)}")
-        print(f"[snapshot] crawl checkpoint saved, {len(cur)} rows")
+        (ck / "info.json").write_text(json.dumps({"t": col.t, "rows": int(len(cur)), "done": done, "total": total}))
+        rawrepo.push_state(branch, f"crawl checkpoint {day_of(col.t)}" + ("" if done >= total else f" ({done}/{total} lists)"))
+        print(f"[snapshot] crawl checkpoint saved, {len(cur)} rows, {done}/{total} lists")
     except Exception as exc:                 # a checkpoint is a convenience; never fail the run for it
         print(f"[snapshot] could not save the crawl checkpoint: {exc!r}")
 
 
-def load_checkpoint(now_t: int, last_t: int, branch: str = "state-crawl"):
-    """A saved crawl that is recent and was not yet turned into a snapshot, or None."""
+def load_checkpoint(now_t: int, last_t: int, total: int, branch: str = "state-crawl"):
+    """A saved crawl that is recent and was not yet turned into a snapshot, or None.
+    Returns (rows, collector, t, done): the finished table when ``done == total``, else
+    the raw rows of the first ``done`` lists."""
     try:
         ck = rawrepo.clone_state(branch)
         info_file = ck / "info.json"
@@ -92,6 +121,9 @@ def load_checkpoint(now_t: int, last_t: int, branch: str = "state-crawl"):
             return None
         info = json.loads(info_file.read_text())
         if now_t - info["t"] > CHECKPOINT_MAX_AGE or info["t"] <= last_t:
+            return None
+        done = info.get("done", total)
+        if info.get("total", total) != total:     # the plan changed; a partial crawl is useless
             return None
         cur = pd.read_parquet(ck / "crawl.parquet")
         if len(cur) != info["rows"]:
@@ -102,7 +134,7 @@ def load_checkpoint(now_t: int, last_t: int, branch: str = "state-crawl"):
         col.fids = {int(k): v for k, v in json.loads((ck / "fids.json").read_text()).items()}
         mt = pd.read_parquet(ck / "meta.parquet")
         col.meta = [(g, uid, d, list(tags), [int(x) for x in at]) for g, uid, d, tags, at in mt.itertuples(index=False, name=None)]
-        return cur, col, info["t"]
+        return cur, col, info["t"], min(done, total)
     except Exception as exc:
         print(f"[snapshot] crawl checkpoint not usable: {exc!r}")
         return None
@@ -360,15 +392,22 @@ def run() -> None:
 
     since = last.get("t", 0)
     partial = bool(os.environ.get("LIMIT_LISTS"))
-    saved = None if partial or env_flag("NO_CHECKPOINT") else load_checkpoint(t, since)
-    if saved:
-        cur, col, t = saved            # the snapshot is dated at the time of the crawl it reuses
+    lists = list_plan()
+    saved = None if partial or env_flag("NO_CHECKPOINT") else load_checkpoint(t, since, len(lists))
+    if saved and saved[3] >= len(lists):
+        cur, col, t, _ = saved         # the snapshot is dated at the time of the crawl it reuses
         print(f"[snapshot] reusing the crawl of {time.strftime('%Y-%m-%d %H:%M', time.gmtime(t))} UTC, {len(cur)} rows")
     else:
-        col = Collector(t)
-        cur = crawl(api, col)
+        seed, done = None, 0
+        if saved:
+            seed, col, t, done = saved
+            print(f"[snapshot] resuming the crawl of {time.strftime('%Y-%m-%d %H:%M', time.gmtime(t))} UTC "
+                  f"at list {done}/{len(lists)}, {len(seed)} rows so far")
+        else:
+            col = Collector(t)
+        cur = crawl(api, col, lists, seed, done, save=None if partial else save_checkpoint)
         if not partial:
-            save_checkpoint(cur, col)
+            save_checkpoint(cur, col, len(lists), len(lists))
     prev = read_parquet(st / "catalog.parquet")
     bootstrap = prev is None
     if bootstrap:

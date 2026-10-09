@@ -16,7 +16,7 @@ build downloads `data/` from here. The design is documented in
 |-----|------|--------------|
 | `pulse` | hourly | Reads every upload of the past 30 days, new artwork ids, the Popular ordering, and who gave each new like. About 700 requests; once a day about 4,500, when every list is read with a long look-ahead. |
 | refresh | every 4 hours, inside the pulse | Adds new-account sampling, new comments and category totals, then rebuilds `data/pulse/`. |
-| `snapshot` | daily | Reads the whole public catalog (about 1.5 million artworks), new files, vanished artworks and featured-artist profiles, then rebuilds `data/daily/`. About 66,000 requests, roughly 2.5 hours. |
+| `snapshot` | daily | Reads the whole public catalog (about 1.5 million artworks), new files, vanished artworks and featured-artist profiles, then rebuilds `data/daily/`. About 66,000 requests, roughly 3.5 hours. The crawl is checkpointed to the raw repository every 20 minutes, and a run started within 6 hours of a failed one resumes from the checkpoint. |
 
 Each job commits `data/` when it changed and asks Cloudflare to rebuild the site.
 
@@ -34,7 +34,8 @@ to this repository with the permission "Actions: read and write". Deploy with
 `npx wrangler deploy` from `worker/`; set the secret with `npx wrangler secret put GITHUB_TOKEN`.
 
 The collector only sends read commands (`stats/api.py` keeps the list) and never likes,
-views or uploads anything.
+views or uploads anything. A failed request is retried with backoff for up to 15 minutes
+(`API_OUTAGE_SECONDS`) before a job gives up, so a short server outage does not end a run.
 
 ## Layout
 
