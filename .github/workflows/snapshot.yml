@@ -3,7 +3,8 @@ name: snapshot
 on:
   schedule:
     # Fallback only: a Cloudflare Worker starts this workflow at 05:43 UTC (worker/).
-    # A run within 12 hours of the previous snapshot exits at once.
+    # The catalog is read every two days: a run within 36 hours of the previous
+    # snapshot exits at once (SNAPSHOT_MIN_GAP_HOURS in stats/snapshot.py).
     - cron: '13 7,9,11 * * *'
   workflow_dispatch:
 

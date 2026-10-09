@@ -16,7 +16,7 @@ build downloads `data/` from here. The design is documented in
 |-----|------|--------------|
 | `pulse` | hourly | Reads every upload of the past 30 days, new artwork ids, the Popular ordering, and who gave each new like. About 700 requests; once a day about 4,500, when every list is read with a long look-ahead. |
 | refresh | every 4 hours, inside the pulse | Adds new-account sampling, new comments and category totals, then rebuilds `data/pulse/`. |
-| `snapshot` | daily | Reads the whole public catalog (about 1.5 million artworks), new files, vanished artworks and featured-artist profiles, then rebuilds `data/daily/`. About 66,000 requests, roughly 3.5 hours. The crawl is checkpointed to the raw repository every 20 minutes, and a run started within 6 hours of a failed one resumes from the checkpoint. |
+| `snapshot` | every two days | Reads the whole public catalog (about 1.5 million artworks), new files, vanished artworks and featured-artist profiles, then rebuilds `data/daily/`. About 66,000 requests, roughly 3.5 hours. The crawl is checkpointed to the raw repository every 20 minutes, and a run started within 6 hours of a failed one resumes from the checkpoint. |
 
 Each job commits `data/` when it changed and asks Cloudflare to rebuild the site.
 
@@ -27,7 +27,8 @@ hours), so a small Cloudflare Worker in [`worker/`](worker/) starts the workflow
 the `workflow_dispatch` API: the pulse at :17 every hour and the snapshot at 05:43 UTC.
 The workflows keep cron lines at other minutes as a fallback. A pulse exits at once when
 the previous one is under 40 minutes old, and a snapshot when the previous one is under
-12 hours old, so extra triggers cost a few seconds.
+36 hours old (the catalog is read every two days, to halve the load on each polling
+account), so extra triggers cost a few seconds.
 
 The Worker holds one secret, `GITHUB_TOKEN`: a fine-grained personal access token limited
 to this repository with the permission "Actions: read and write". Deploy with
@@ -45,7 +46,7 @@ stats/accounts.py   polling account pool: token reuse, health checks, rotation, 
 stats/rawrepo.py    git plumbing for the private raw-data repository
 stats/pulse.py      hourly job
 stats/refresh.py    4-hour polling and data/pulse/*.json
-stats/snapshot.py   daily job
+stats/snapshot.py   whole-catalog job, every two days
 stats/daily.py      data/daily/*.json
 stats/files.py      artwork file features and hashes, avatars
 config/             automated account ranges, artists who asked not to be listed

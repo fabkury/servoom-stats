@@ -85,6 +85,10 @@ def crawl(api: Api, col: Collector, lists: list, seed: Optional[pd.DataFrame] = 
 
 
 CHECKPOINT_MAX_AGE = 6 * 3600
+# The catalog is read every two days (decided 2026-10-09 to halve the request volume
+# per polling account). The worker still dispatches daily; a run sooner than this
+# after the last snapshot exits at once.
+SNAPSHOT_GAP = int(os.environ.get("SNAPSHOT_MIN_GAP_HOURS", "36")) * 3600
 CHECKPOINT_EVERY = 20 * 60
 
 
@@ -376,8 +380,9 @@ def run() -> None:
     main = rawrepo.clone_main(["state"] + [f"obs/pulse/{d}" for d in days])
     lastf = st / "last_snapshot.json"
     last = json.loads(lastf.read_text()) if lastf.exists() else {}
-    if t - last.get("t", 0) < 12 * 3600 and not env_flag("FORCE_SNAPSHOT"):
-        print("[snapshot] the last snapshot is less than 12 hours old; nothing to do")
+    if t - last.get("t", 0) < SNAPSHOT_GAP and not env_flag("FORCE_SNAPSHOT"):
+        print(f"[snapshot] the last snapshot is {(t - last['t']) // 3600} hours old, under "
+              f"{SNAPSHOT_GAP // 3600}; nothing to do")
         return
     # Deep pages answer slowly, so many workers are needed to reach the request rate.
     api = Api(rps=float(os.environ.get("SNAPSHOT_RPS", "8")), workers=24)
