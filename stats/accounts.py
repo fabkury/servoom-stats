@@ -165,7 +165,10 @@ class Pool:
             a = self._register(api, "spare")
             if a is None:
                 return
-            if self._try(api, a) != "ok":
+            if self._try(api, a) == "ok":
+                a["last_ok"] = int(time.time())
+                self.save(a)                       # keeps the token for when it takes a role
+            else:
                 a["status"] = "bad"
                 self.save(a)
                 note_issue("A newly registered account failed its health check",
