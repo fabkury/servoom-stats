@@ -20,6 +20,12 @@ FILE_HOST = "https://f.divoom-gz.com"
 # three-hour crawl.
 OUTAGE = float(os.environ.get("API_OUTAGE_SECONDS", str(15 * 60)))
 RETRY_CAP = 60.0
+# Since 2026-10-12 the server serves one source at most 120 requests per clock minute and
+# answers the rest with 12 "Request data is null" (measured from GitHub runners on
+# 2026-10-13: the first refusal was always request #120 of the minute, at any rate from
+# 3 to 8 per second; 2 per second ran clean). Nothing may ask for more than this.
+MAX_RPS = float(os.environ.get("API_MAX_RPS", "2"))
+LIMITED_WAIT = 5.0             # pause after a 12, repeated until the minute window opens
 
 # Commands this pipeline is allowed to send. Anything else is a programming error:
 # the collector must never call a command that changes server state.
@@ -40,12 +46,13 @@ class ApiDown(Exception):
 class Api:
     def __init__(self, rps: float = 4.0, workers: int = 4):
         self.s = requests.Session()
-        self.interval = 1.0 / rps
+        self.interval = 1.0 / min(rps, MAX_RPS)
         self.workers = workers
         self._lock = threading.Lock()
         self._next = 0.0
         self.auth: Dict = {}
         self.n_requests = 0
+        self.n_limited = 0
         self._last_ok = time.monotonic()
 
     def _wait(self) -> None:
@@ -64,13 +71,18 @@ class Api:
         while True:
             self._wait()
             try:
-                # One connection, not one client, is served at most 40 requests: from the
-                # 41st on, every answer is 12 "Request data is null" (since 2026-10-12).
-                r = self.s.post(f"{HOST}/{cmd}", json=payload, timeout=30, headers={"Connection": "close"})
+                r = self.s.post(f"{HOST}/{cmd}", json=payload, timeout=30)
                 self.n_requests += 1
                 if r.status_code >= 500:
                     raise requests.HTTPError(f"HTTP {r.status_code}")
                 data = r.json()
+                if data.get("ReturnCode") == 12:        # over the per-minute budget: wait it out
+                    self.n_limited += 1
+                    if time.monotonic() - t0 > OUTAGE:
+                        raise ApiDown(f"{cmd}: rate-limited (12) for {OUTAGE:.0f}s")
+                    with self._lock:
+                        self._next = max(self._next, time.monotonic() + LIMITED_WAIT)
+                    continue
                 self._last_ok = time.monotonic()
                 return data
             except (requests.RequestException, ValueError) as exc:
@@ -107,12 +119,6 @@ class Api:
         body = {"Classify": classify, "FileSize": size, "FileType": 5, "FileSort": sort,
                 "Version": 19, "RefreshIndex": 0, "StartNum": start, "EndNum": start + n - 1}
         r = self.post("GetCategoryFileListV2", body)
-        for _ in range(3):             # 12 "Request data is null" is a worn-out connection
-            if r.get("ReturnCode") != 12:
-                break
-            self.s.close()
-            time.sleep(1)
-            r = self.post("GetCategoryFileListV2", body)
         if r.get("ReturnCode") not in (0, 1):
             raise ApiDown(f"listing answered {r.get('ReturnCode')} {r.get('ReturnMessage')}")
         return r.get("FileList") or []
