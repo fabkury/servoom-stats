@@ -1,0 +1,30 @@
+name: diag
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+      - run: pip install -q requests
+      - run: |
+          curl -s https://ifconfig.me; echo
+          python - <<'PY'
+          import requests, json
+          s = requests.Session()
+          H = "https://appin.divoom-gz.com"
+          def lp(c, size, start, **kw):
+              b = {"Classify": c, "FileSize": size, "FileType": 5, "FileSort": 0, "Version": 19, "RefreshIndex": 0, "StartNum": start, "EndNum": start + 29, **kw}
+              r = s.post(f"{H}/GetCategoryFileListV2", json=b, timeout=30)
+              d = r.json()
+              return r.status_code, d.get("ReturnCode"), d.get("ReturnMessage"), len(d.get("FileList") or []), d.get("FileListNum"), d.get("readcacheinof")
+          for c, size, st in [(1,1,1),(1,1,61),(1,1,3001),(16,1,1),(16,1,61),(16,1,1201),(5,4,1),(18,1,1)]:
+              print("cls", c, "size", size, "start", st, lp(c, size, st))
+          print("no RefreshIndex:", lp(1,1,1, RefreshIndex=None))
+          b = {"Classify": 1, "FileSize": 1, "FileType": 5, "FileSort": 0, "Version": 19, "StartNum": 1, "EndNum": 30}
+          d = s.post(f"{H}/GetCategoryFileListV2", json=b, timeout=30).json(); print("canary-shaped page1:", d.get("ReturnCode"), d.get("ReturnMessage"), len(d.get("FileList") or []))
+          d = s.post(f"{H}/GetCategoryFileListV2", json={**b, "StartNum": 3001, "EndNum": 3030}, timeout=30).json(); print("canary-shaped 3001:", d.get("ReturnCode"), d.get("ReturnMessage"), len(d.get("FileList") or []))
+          print("raw headers page1:", dict(s.post(f"{H}/GetCategoryFileListV2", json=b, timeout=30).headers))
+          PY
