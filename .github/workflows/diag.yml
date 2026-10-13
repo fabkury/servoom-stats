@@ -21,29 +21,33 @@ jobs:
           export GIT_SSH_COMMAND="ssh -i ~/.ssh/raw_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
           python - <<'PY'
           import json, time
-          from concurrent.futures import ThreadPoolExecutor
           from stats import rawrepo
-          from stats.api import Api, HOST
+          from stats.api import Api, ApiDown
           main = rawrepo.clone_main(["state"])
           a = json.loads((main / "state/accounts/pulse-01.json").read_text())
           print("::add-mask::" + str(a["token"])); print("::add-mask::" + str(a["md5"]))
           api = Api(rps=6, workers=4)
-          def lp(auth, c, size, start, refresh=True):
-              api.auth = {"Token": a["token"], "UserId": a["user_id"]} if auth else {}
-              b = {"Classify": c, "FileSize": size, "FileType": 5, "FileSort": 0, "Version": 19, "StartNum": start, "EndNum": start + 29}
-              if refresh: b["RefreshIndex"] = 0
-              d = api.post("GetCategoryFileListV2", b)
-              return d.get("ReturnCode"), d.get("ReturnMessage"), len(d.get("FileList") or []), d.get("FileListNum")
-          print("authed canary 3001 no-refresh ", lp(True, 1, 1, 3001, refresh=False))
-          print("authed cls1 s1 page1 refresh   ", lp(True, 1, 1, 1))
-          print("authed cls1 s1 page1 no-refresh", lp(True, 1, 1, 1, refresh=False))
-          print("anon   cls1 s1 page1 refresh   ", lp(False, 1, 1, 1))
-          print("authed cls16 s1 page1          ", lp(True, 16, 1, 1))
-          print("authed cls1 s1 start 61        ", lp(True, 1, 1, 61))
           api.auth = {"Token": a["token"], "UserId": a["user_id"]}
-          with ThreadPoolExecutor(4) as ex:
-              res = list(ex.map(lambda k: lp(True, 1, 1, 1 + 30 * k), range(8)))
-          print("authed wave of 8:", [r[0] for r in res])
-          print("authed canary again            ", lp(True, 1, 1, 3001, refresh=False))
-          print("GetLikeUserList", api.post("Cloud/GetLikeUserList", {"GalleryId": 1, "StartNum": 1, "EndNum": 1}).get("ReturnCode"))
+          orig = api.post
+          log = []
+          def post(cmd, body=None, auth=True):
+              d = orig(cmd, body, auth)
+              code = d.get("ReturnCode")
+              log.append((body.get("Classify"), body.get("FileSize"), body.get("StartNum"), code, len(d.get("FileList") or [])))
+              if code not in (0, 1):
+                  print("NON-ZERO:", cmd, {k: v for k, v in body.items()}, "->", code, d.get("ReturnMessage"), "n_requests", api.n_requests)
+              return d
+          api.post = post
+          cutoff = int(time.time()) - 30 * 86400
+          from stats.util import CATEGORIES, ALL_SIZES
+          try:
+              for cls in CATEGORIES:
+                  for size in ALL_SIZES:
+                      fl = api.crawl_list(cls, size, stop_before=cutoff, old_streak=2)
+                      print("list", cls, size, "ok pages", len([x for x in log if x[0] == cls and x[1] == size]), "items", len(fl), "n_requests", api.n_requests)
+                      if api.n_requests > 400: break
+                  if api.n_requests > 400: break
+          except ApiDown as exc:
+              print("APIDOWN:", exc, "after", api.n_requests, "requests")
+              print("last 12 pages:", log[-12:])
           PY
