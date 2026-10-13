@@ -26,7 +26,7 @@ jobs:
           from stats.api import Api, HOST
           main = rawrepo.clone_main(["state"])
           a = json.loads((main / "state/accounts/pulse-01.json").read_text())
-          print("::add-mask::" + a["token"]); print("::add-mask::" + a["md5"])
+          print("::add-mask::" + str(a["token"])); print("::add-mask::" + str(a["md5"]))
           api = Api(rps=6, workers=4)
           def lp(auth, c, size, start, refresh=True):
               api.auth = {"Token": a["token"], "UserId": a["user_id"]} if auth else {}
