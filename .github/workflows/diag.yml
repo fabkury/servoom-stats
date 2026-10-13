@@ -20,35 +20,21 @@ jobs:
           printf '%s\n' "$RAW_REPO_DEPLOY_KEY" > ~/.ssh/raw_key && chmod 600 ~/.ssh/raw_key
           export GIT_SSH_COMMAND="ssh -i ~/.ssh/raw_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
           python - <<'PY'
-          import json, time, requests, collections
-          from concurrent.futures import ThreadPoolExecutor
-          from stats import rawrepo
-          main = rawrepo.clone_main(["state"])
-          a = json.loads((main / "state/accounts/spare-01.json").read_text())
-          print("::add-mask::" + str(a["token"])); print("::add-mask::" + str(a["md5"]))
+          import time, requests, collections
           H = "https://appin.divoom-gz.com"
-          AUTH = {"Token": a["token"], "UserId": a["user_id"]}
-          def body(k, auth): return {**(AUTH if auth else {}), "Classify": 1, "FileSize": 1, "FileType": 5, "FileSort": 0, "Version": 19, "RefreshIndex": 0, "StartNum": 1 + 30 * (k % 50), "EndNum": 30 + 30 * (k % 50)}
-          def seq(label, auth, n, close, sleep):
-              s = requests.Session(); codes = []
-              for k in range(n):
-                  r = s.post(f"{H}/GetCategoryFileListV2", json=body(k, auth), timeout=30, headers={"Connection": "close"} if close else {})
-                  codes.append(r.json().get("ReturnCode")); time.sleep(sleep)
-              first = next((i for i, c in enumerate(codes) if c == 12), None)
-              print(f"{label}: {dict(collections.Counter(codes))} first 12 at #{first}; pattern {''.join('.' if c == 0 else 'X' for c in codes)}")
-          seq("authed, Connection: close, 120 seq, 0.12s", True, 120, True, 0.12)
-          seq("anon,   Connection: close, 120 seq, 0.12s", False, 120, True, 0.12)
-          seq("authed, keep-alive, 60 seq", True, 60, False, 0.12)
-          def par(label, auth, n, workers, close):
-              s = requests.Session()
+          def body(k): return {"Classify": 1, "FileSize": 1, "FileType": 5, "FileSort": 0, "Version": 19, "RefreshIndex": 0, "StartNum": 1 + 30 * (k % 50), "EndNum": 30 + 30 * (k % 50)}
+          s = requests.Session()
+          def run(rps, seconds, workers=1):
+              from concurrent.futures import ThreadPoolExecutor
+              n = int(rps * seconds); t0 = time.time(); codes = [None] * n
               def one(k):
-                  r = s.post(f"{H}/GetCategoryFileListV2", json=body(k, auth), timeout=30, headers={"Connection": "close"} if close else {})
-                  return r.json().get("ReturnCode")
-              with ThreadPoolExecutor(workers) as ex: codes = list(ex.map(one, range(n)))
+                  t = t0 + k / rps
+                  if t > time.time(): time.sleep(t - time.time())
+                  codes[k] = s.post(f"{H}/GetCategoryFileListV2", json=body(k), timeout=30).json().get("ReturnCode")
+              with ThreadPoolExecutor(workers) as ex: list(ex.map(one, range(n)))
               first = next((i for i, c in enumerate(codes) if c == 12), None)
-              print(f"{label}: {dict(collections.Counter(codes))} first 12 at #{first}; pattern {''.join('.' if c == 0 else 'X' for c in codes)}")
-          par("authed, Connection: close, 24 workers x 240", True, 240, 24, True)
-          par("anon,   Connection: close, 24 workers x 240", False, 240, 24, True)
-          time.sleep(20)
-          seq("authed after 20 s pause, Connection: close, 40 seq", True, 40, True, 0.12)
+              print(f"{rps} rps x {seconds}s, {workers} workers: {dict(collections.Counter(codes))} first 12 at #{first} ({time.time()-t0:.0f}s)", flush=True)
+          for rps, sec in [(2, 60), (3, 60), (4, 60), (5, 60), (8, 40)]:
+              time.sleep(25); run(rps, sec, workers=4)
+          time.sleep(25); run(3, 120, workers=4)
           PY
