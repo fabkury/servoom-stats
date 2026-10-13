@@ -1,0 +1,36 @@
+name: diag
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+      - run: pip install -q requests
+      - run: |
+          python - <<'PY'
+          import requests, collections, socket, time
+          H = "https://appin.divoom-gz.com"
+          print("resolves to", sorted({a[4][0] for a in socket.getaddrinfo("appin.divoom-gz.com", 443)}))
+          b = {"Classify": 12, "FileSize": 4, "FileType": 5, "FileSort": 0, "Version": 19, "RefreshIndex": 0, "StartNum": 1, "EndNum": 30}
+          def run(label, post):
+              codes, hdr = collections.Counter(), {}
+              for i in range(80):
+                  r = post()
+                  d = r.json(); c = d.get("ReturnCode"); codes[c] += 1
+                  hdr.setdefault(c, {k: v for k, v in r.headers.items() if k.lower() not in ("date", "content-length")})
+                  time.sleep(0.15)
+              print(label, dict(codes)); [print("   headers for", c, h) for c, h in hdr.items()]
+          run("fresh connection each", lambda: requests.post(f"{H}/GetCategoryFileListV2", json=b, timeout=30, headers={"Connection": "close"}))
+          s = requests.Session(); run("one keep-alive session", lambda: s.post(f"{H}/GetCategoryFileListV2", json=b, timeout=30))
+          ss = [requests.Session() for _ in range(4)]
+          from concurrent.futures import ThreadPoolExecutor
+          def one(k):
+              d = ss[k % 4].post(f"{H}/GetCategoryFileListV2", json={**b, "StartNum": 1 + 30 * (k % 10)}, timeout=30).json(); return k % 4, d.get("ReturnCode")
+          with ThreadPoolExecutor(4) as ex: res = list(ex.map(one, range(160)))
+          print("4 sessions parallel:", collections.Counter(res))
+          PY
