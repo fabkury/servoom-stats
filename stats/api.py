@@ -102,9 +102,17 @@ class Api:
 
     # -- helpers ------------------------------------------------------------
     def list_page(self, classify: int, size: int, start: int, sort: int = 0, n: int = 30) -> List[Dict]:
-        r = self.post("GetCategoryFileListV2", {
-            "Classify": classify, "FileSize": size, "FileType": 5, "FileSort": sort,
-            "Version": 19, "RefreshIndex": 0, "StartNum": start, "EndNum": start + n - 1})
+        body = {"Classify": classify, "FileSize": size, "FileType": 5, "FileSort": sort,
+                "Version": 19, "RefreshIndex": 0, "StartNum": start, "EndNum": start + n - 1}
+        r = self.post("GetCategoryFileListV2", body)
+        if r.get("ReturnCode") == 12:
+            # Since 2026-10-12 some of Divoom's servers answer a page past the end of a
+            # list with 12 "Request data is null" instead of an empty page. A real page
+            # never answers 12 twice in a row, so a second 12 is the end of the list.
+            time.sleep(1)
+            r = self.post("GetCategoryFileListV2", body)
+            if r.get("ReturnCode") == 12:
+                return []
         if r.get("ReturnCode") not in (0, 1):
             raise ApiDown(f"listing answered {r.get('ReturnCode')} {r.get('ReturnMessage')}")
         return r.get("FileList") or []
