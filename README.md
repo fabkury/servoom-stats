@@ -20,6 +20,14 @@ build downloads `data/` from here. The design is documented in
 
 Each job commits `data/` when it changed and asks Cloudflare to rebuild the site.
 
+Every run also appends one row to `runs.parquet` on its state branch, and `stats/health.py`
+turns the run logs and the rollups into `data/health/*.json`: for each collector (hourly
+pulse, 4-hour refresh, snapshot, catalog reach), contiguous spans marked `ok`, `degraded`
+or `missing` with the evidence (`gap`, `spread`, `partial`, `no_token`, `reach`,
+`skipped`). The site shades those spans on every chart that draws from the collector and
+shows the whole history on the overview page. Nothing in it is written by hand:
+`config/health_seed.json` only lists the refresh times from before the run log existed.
+
 ## What starts the jobs
 
 GitHub's own schedule for Actions proved unreliable (one scheduled run in the first eight
@@ -49,6 +57,7 @@ stats/refresh.py    4-hour polling and data/pulse/*.json
 stats/snapshot.py   whole-catalog job, every two days
 stats/daily.py      data/daily/*.json
 stats/files.py      artwork file features and hashes, avatars
+stats/health.py     collection health lanes, data/health/*.json
 config/             automated account ranges, artists who asked not to be listed
 data/               published aggregates (JSON) and featured artists' avatars (WebP)
 ```

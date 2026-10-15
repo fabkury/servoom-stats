@@ -14,7 +14,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from . import daily, files, rawrepo
+from . import daily, files, health, rawrepo
 from .accounts import Halted, Pool, flush_issues, note_issue
 from .api import Api, ApiDown
 from .util import (ALL_SIZES, CATEGORIES, CONFIG, DATA, DAY, PHOTO, ROW_FIELDS, add_rollup, day_of, env_flag,
@@ -533,6 +533,11 @@ def run() -> None:
     # build the public aggregates, then persist state
     ctx.update(requests=api.n_requests, prev_last=prev_last, ev=ev, cm=cm, top=top, m=m)
     step("build", lambda: daily.build(st, cat, users, acc, meta, ctx))
+    # one row per run, the evidence the health lanes are built from (stats/health.py)
+    health.log_run(st, {"t": t, "since": since, "rows": int(len(cur)), "catalog": int((cat.gone == 0).sum()),
+                        "requests": api.n_requests, "limited": api.n_limited, "partial": int(partial),
+                        "warnings": ",".join(ctx["warnings"]), "seconds": now() - t})
+    step("health", lambda: health.build_snapshot(st, t))
     write_parquet(cat, st / "catalog.parquet")
     write_parquet(users, st / "users.parquet")
     write_parquet(meta, st / "meta_recent.parquet")

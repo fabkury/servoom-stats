@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import rawrepo, refresh
+from . import health, rawrepo, refresh
 from .accounts import Halted, Pool, flush_issues
 from .api import Api, ApiDown
 from .util import (ALL_SIZES, CATEGORIES, DAY, PHOTO, SIZES, add_rollup, env_flag, is_auto, load_ranges,
@@ -295,11 +295,24 @@ def run() -> None:
 
     lr = st / "last_refresh.json"
     refresh_age = t - json.loads(lr.read_text())["t"] if lr.exists() else None
+    refreshed = 0                       # 1 the refresh ran, -1 it failed, 0 not due this hour
     if refresh_age is None or refresh_age > REFRESH_EVERY or env_flag("FORCE_REFRESH") or bootstrap:
         try:
             refresh.run(api, st, main, win, t, authed)
+            refreshed = 1
         except Exception as exc:  # a failed refresh must not lose the pulse
+            refreshed = -1
             print(f"[refresh] failed: {exc!r}")
+            if env_flag("STRICT"):
+                raise
+    # one row per run, the evidence the health lanes are built from (stats/health.py)
+    health.log_run(st, {"t": t, "hour": hour, "mode": meta["mode"], "requests": api.n_requests, "limited": api.n_limited,
+                        "n_window": meta["n_window"], "n_listed": meta["n_listed"], "seconds": now() - t, "refresh": refreshed})
+    if refreshed:                       # with the refresh, so the site is rebuilt every 4 hours, not hourly
+        try:
+            health.build_pulse(st, t)
+        except Exception as exc:
+            print(f"[health] failed: {exc!r}")
             if env_flag("STRICT"):
                 raise
     rawrepo.push_state("state-pulse", f"pulse {time.strftime('%Y-%m-%d %H:%M', time.gmtime(t))}")
