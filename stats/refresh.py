@@ -221,7 +221,8 @@ def build(st: Path, win: pd.DataFrame, t: int, authed: bool) -> None:
         g = pr.groupby("rel", as_index=False)[["n", "dl", "dlp", "dv", "dt"]].sum()
         g["hrs"] = g.dt / 3600
         g = g[g.hrs > 0]
-        promo["after"] = recs(g.assign(likes=g.dl / g.hrs, people=g.dlp / g.hrs, views=g.dv / g.hrs)[["rel", "n", "likes", "people", "views"]])
+        # hrs lets the page re-bin the hourly buckets with the right weights
+        promo["after"] = recs(g.assign(likes=g.dl / g.hrs, people=g.dlp / g.hrs, views=g.dv / g.hrs)[["rel", "n", "hrs", "likes", "people", "views"]])
     out["promo"] = promo
 
     # every upload, listed or not
