@@ -1,4 +1,8 @@
-"""Every-4-hours refresh: a few slow sources, then ``data/pulse/*.json`` for the site."""
+"""Every-4-hours refresh: two slow sources, then ``data/pulse/*.json`` for the site.
+
+The category totals and the follow-up of held uploads ran here until 2026-10-26; they
+are daily and moved to stats/probe.py, whose results the pulse takes over.
+"""
 
 from __future__ import annotations
 
@@ -44,7 +48,7 @@ def poll_signups(api: Api, st: Path, t: int) -> None:
     span = hi - lo
     if span <= 0:
         return
-    ids = random.sample(range(lo + 1, hi + 1), min(200, span))
+    ids = random.sample(range(lo + 1, hi + 1), min(100, span))
     infos = api.pmap(api.user_info, ids)
     ok = [(u, r) for u, r in zip(ids, infos) if r.get("ReturnCode") == 0]
     cc = pd.Series([r.get("CountryISOCode") or "??" for _, r in ok]).value_counts()
@@ -61,7 +65,7 @@ def poll_comments(api: Api, st: Path, main: Path, win: pd.DataFrame, t: int) -> 
     salt = salt_file.read_text().strip() if salt_file.exists() else "unsalted"
     lf = st / "last_refresh.json"
     since = json.loads(lf.read_text())["t"] if lf.exists() else t - 4 * 3600
-    todo = win[(win.cmt > win.cmt_ref) | (win.cmtutc > since)].gid.head(400).tolist()
+    todo = win[(win.cmt > win.cmt_ref) | (win.cmtutc > since)].gid.head(150).tolist()
     ranges = load_ranges()
     rows = []
     for gid, cl in zip(todo, api.pmap(api.comments, todo)):
@@ -307,10 +311,8 @@ def build(st: Path, win: pd.DataFrame, t: int, authed: bool) -> None:
 
 
 def run(api: Api, st: Path, main: Path, win: pd.DataFrame, t: int, authed: bool) -> None:
-    for name, fn in (("signups", lambda: poll_signups(api, st, t)),
-                     ("comments", lambda: poll_comments(api, st, main, win, t)),
-                     ("categories", lambda: poll_categories(api, st, t) if authed else None),
-                     ("held", lambda: follow_up_held(api, st, t) if authed else None)):
+    for name, fn in (("comments", lambda: poll_comments(api, st, main, win, t)),
+                     ("signups", lambda: poll_signups(api, st, t))):
         try:
             fn()
         except ApiDown as exc:

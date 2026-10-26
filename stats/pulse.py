@@ -1,6 +1,14 @@
 """Hourly pulse: counters for every upload of the past 30 days, new artwork ids,
 the Popular ordering, and who gave each new like. Every fourth hour it also runs the
 refresh, which polls a few slow sources and rebuilds ``data/pulse``.
+
+Since Divoom's budget of 30 requests a minute (2026-10-23) a pulse reads for at most
+BUDGET seconds: the window listings come first, then the feeds, then the re-reads of
+omitted artworks, the like lists, the id walk and the refresh. What the budget cuts is
+left out of the hour and logged (``skipped`` in the run log), and the health lanes
+show the hour as degraded for that reason. The daily look-ahead over every list, the
+category totals and the review follow-up moved to stats/probe.py, which has its own
+runner and so its own budget.
 """
 
 from __future__ import annotations
@@ -16,45 +24,82 @@ import pandas as pd
 
 from . import health, rawrepo, refresh
 from .accounts import Halted, Pool, flush_issues
-from .api import Api, ApiDown
+from .api import Api, ApiDown, OutOfTime
 from .util import (ALL_SIZES, CATEGORIES, DAY, PHOTO, SIZES, add_rollup, env_flag, is_auto, load_ranges,
                    now, read_parquet, rows_frame, tier, write_parquet)
 
 pd.set_option("future.no_silent_downcasting", True)
 WINDOW_DAYS = int(os.environ.get("PULSE_DAYS", "30"))
 AGE_BANDS = [0, 1, 3, 7, 14, 31]
-MIN_GAP = 40 * 60              # a pulse is skipped when the previous one is younger than this
+MIN_GAP = 50 * 60              # a pulse is skipped when the previous one is younger than this
 REFRESH_EVERY = 3.75 * 3600    # the site data is rebuilt by the first pulse after this long
+BUDGET = int(os.environ.get("PULSE_BUDGET_SECONDS", str(48 * 60)))   # reading time per run
+REFRESH_MIN_LEFT = 4 * 60      # the refresh waits for the next hour when less is left
 POPULAR_CATS = [3, 6, 8, 12, 1, 4]
 CARRY = ["first_seen", "t_new", "t_rec", "lp", "la", "cmt_ref", "miss"]
 
 
-def crawl_window(api: Api, st: Path, t: int, cutoff: int):
+def crawl_window(api: Api, st: Path, t: int, cutoff: int, probe: dict):
+    """Records of the window from every list known to hold some; (records, complete)."""
     lists_file = st / "lists.json"
     known = json.loads(lists_file.read_text()) if lists_file.exists() else {}
-    probe_all = t - known.get("_probed", 0) > 23 * 3600          # first run, then once a day
-    if probe_all:
-        known["_probed"] = t
-    records = []
+    # The daily probe (stats/probe.py) reads every list with a long look-ahead and
+    # reports which hold window artworks, and whether an old block sits in the list.
+    for key, v in probe.items():
+        if key.startswith("_"):
+            continue
+        if v.get("n") and v["t"] > known.get(key, {}).get("t", 0):
+            known[key] = {"n": v["n"], "t": v["t"], "block": v.get("block", False)}
+        elif key in known:
+            known[key]["block"] = v.get("block", False)
+    known.pop("_probed", None)
+    records, complete = [], True
     for cls in CATEGORIES:
         for size in ALL_SIZES:
             key = f"{cls}_{size}"
-            if not probe_all and key not in known:
+            if key not in known:
                 continue
             # Lists are not strictly newest-first: at times a long run of much older
-            # artworks sits right after the newest 60. Once a day every list is read
-            # with a long look-ahead; the hourly reads rely on the newest pages plus
-            # the per-artwork refresh in refresh_missing().
-            fl = api.crawl_list(cls, size, stop_before=cutoff, old_streak=16 if probe_all else 2)
-            block = api.last_gap if probe_all else known.get(key, {}).get("block", False)
+            # artworks sits right after the newest 60. The hourly read uses a short
+            # look-ahead and relies on the daily probe plus refresh_missing().
+            try:
+                fl = api.crawl_list(cls, size, stop_before=cutoff, old_streak=2)
+            except OutOfTime:
+                complete = False
+                break
             fl = [x for x in fl if x["Date"] >= cutoff]
             if fl:
-                known[key] = {"n": len(fl), "t": t, "block": block}
-            elif key in known and t - known[key]["t"] > 40 * DAY:
+                known[key] = {"n": len(fl), "t": t, "block": known[key].get("block", False)}
+            elif t - known[key]["t"] > 40 * DAY:
                 del known[key]
             records.extend(fl)
+        if not complete:
+            break
     lists_file.write_text(json.dumps(known))
-    return records
+    return records, complete
+
+
+def apply_probe(st: Path, pr: Path) -> dict:
+    """Take over what the daily probe left on its branch: the category totals and the
+    outcome of held uploads; returns its list survey."""
+    out = {}
+    f = pr / "lists.json"
+    if f.exists():
+        out = json.loads(f.read_text())
+    c, mine = pr / "categories.json", st / "categories.json"
+    if c.exists():
+        newer = not mine.exists() or json.loads(c.read_text())["log"][-1:] != json.loads(mine.read_text())["log"][-1:]
+        if newer:
+            mine.write_text(c.read_text())
+    h = read_parquet(pr / "held.parquet")
+    w = read_parquet(st / "walk.parquet")
+    if h is not None and len(h) and w is not None and len(w):
+        res = h.drop_duplicates("gid", keep="last").set_index("gid")
+        idx = w.gid.isin(res.index) & w.t_res.isna()
+        w.loc[idx, "chk_final"] = w.loc[idx, "gid"].map(res.chk_final).to_numpy()
+        w.loc[idx, "t_res"] = w.loc[idx, "gid"].map(res.t_res).to_numpy()
+        write_parquet(w, st / "walk.parquet")
+    return out
 
 
 def refresh_missing(api: Api, cur: pd.DataFrame, prev: pd.DataFrame, t: int, cutoff: int) -> pd.DataFrame:
@@ -64,7 +109,7 @@ def refresh_missing(api: Api, cur: pd.DataFrame, prev: pd.DataFrame, t: int, cut
     read with Cloud/GalleryInfo so the hourly series has no holes; what the record
     lacks (category, canvas size, curation flags) is carried over from the last reading.
     """
-    miss = prev[~prev.gid.isin(cur.gid) & (prev.date >= cutoff)].sort_values("date", ascending=False).head(2500)
+    miss = prev[~prev.gid.isin(cur.gid) & (prev.date >= cutoff)].sort_values("date", ascending=False).head(400)
     rows = []
     for row, r in zip(miss.to_dict("records"), api.pmap(api.gallery_info, miss.gid.tolist())):
         if r.get("ReturnCode") != 0 or int(r.get("PrivateFlag") or 0) or int(r.get("IsDel") or 0):
@@ -166,16 +211,35 @@ def run() -> None:
         print(f"[pulse] the last pulse was {age // 60} minutes ago; nothing to do")
         return
     main = rawrepo.clone_main(["state"])
-    api = Api(rps=float(os.environ.get("PULSE_RPS", "6")), workers=4)
+    api = Api(workers=4)
+    api.set_budget(BUDGET)
     pool, authed = Pool(main), True
     try:
         pool.acquire(api, "pulse")
     except (Halted, ApiDown) as exc:        # degraded mode: list heads need no token
         print(f"[pulse] running without a token: {exc}")
         api.auth, authed = {}, False
+    probe = apply_probe(st, rawrepo.clone_state("state-probe"))
 
-    records = crawl_window(api, st, t, cutoff)
-    heads, popular = crawl_feeds(api, cutoff)
+    skipped = []                            # phases the reading budget cut, in order
+
+    def phase(name, fn, default):
+        try:
+            return fn()
+        except OutOfTime:
+            skipped.append(name)
+            print(f"[pulse] out of time before {name}")
+            return default
+
+    def spent(name) -> None:                # a phase that swallows ApiDown per item
+        if api.seconds_left is not None and api.seconds_left <= 0 and name not in skipped:
+            skipped.append(name)
+
+    records, complete = crawl_window(api, st, t, cutoff, probe)
+    if not complete:
+        skipped.append("window")
+    heads, popular = phase("feeds", lambda: crawl_feeds(api, cutoff), ([], pd.DataFrame()))
+    spent("feeds")
     cur = rows_frame(records + heads, t)
     cur = cur[cur.priv == 0].drop(columns=["priv"])
     prev = read_parquet(st / "window.parquet")
@@ -183,8 +247,8 @@ def run() -> None:
     if bootstrap:
         prev = pd.DataFrame(columns=list(cur.columns) + CARRY)
     n_listed = len(cur)
-    if authed and not bootstrap:
-        cur = refresh_missing(api, cur, prev, t, cutoff)
+    if authed and not bootstrap and complete:       # after a cut window, omissions are the cut
+        cur = phase("missing", lambda: refresh_missing(api, cur, prev, t, cutoff), cur)
     p = prev[["gid", "like", "watch", "cmt", "new", "rec", "t"] + CARRY].add_suffix("_p").rename(columns={"gid_p": "gid"})
     d = cur.merge(p, on="gid", how="left")
     isnew = d.like_p.isna()
@@ -199,6 +263,7 @@ def run() -> None:
     d["dt"] = np.where(isnew & ~fresh, 0, t - d.t_p)
 
     ev = like_events(api, d, t, authed)
+    spent("likes")
     per = ev.groupby("gid").auto.agg(["sum", "count"]) if len(ev) else pd.DataFrame(columns=["sum", "count"])
     d["dla"] = d.gid.map(per["sum"]).fillna(0).astype("int64")
     d["dlp"] = (d.gid.map(per["count"]).fillna(0) - d.dla).astype("int64")
@@ -262,7 +327,8 @@ def run() -> None:
                 rec=("rec", "max"), new=("new", "max"), lp0=("lp0", "first"), la0=("la0", "first"))
         write_parquet(g[g.last_t > t - 90 * DAY], st / "popular.parquet")
 
-    walk = id_walk(api, st, set(cur.gid), t, authed)
+    walk = phase("walk", lambda: id_walk(api, st, set(cur.gid), t, authed), pd.DataFrame(
+        columns=["gid", "t", "date", "priv", "isdel", "chk", "listed"]))
     if len(walk):
         w = read_parquet(st / "walk.parquet")
         w = pd.concat(([w] if w is not None else []) + [walk.assign(chk_final=np.nan, t_res=np.nan)], ignore_index=True)
@@ -288,18 +354,24 @@ def run() -> None:
         gone = gone[gone.miss <= 72]
     win = pd.concat([d[keep], gone[keep]], ignore_index=True)
     write_parquet(win, st / "window.parquet")
-    meta = {"t": t, "mode": "normal" if authed else "degraded", "requests": api.n_requests,
-            "n_window": int(len(d)), "n_listed": int(n_listed), "window_days": WINDOW_DAYS, "bootstrap": bootstrap}
+    meta = {"t": t, "mode": "normal" if authed else "degraded", "requests": api.n_requests, "served": api.n_served,
+            "limited": api.n_limited, "n_window": int(len(d)), "n_listed": int(n_listed), "window_days": WINDOW_DAYS,
+            "bootstrap": bootstrap, "skipped": skipped, "seconds_left": None if api.seconds_left is None else int(api.seconds_left)}
     (st / "last_pulse.json").write_text(json.dumps(meta))
     print(f"[pulse] {meta}")
 
     lr = st / "last_refresh.json"
     refresh_age = t - json.loads(lr.read_text())["t"] if lr.exists() else None
     refreshed = 0                       # 1 the refresh ran, -1 it failed, 0 not due this hour
-    if refresh_age is None or refresh_age > REFRESH_EVERY or env_flag("FORCE_REFRESH") or bootstrap:
+    due = refresh_age is None or refresh_age > REFRESH_EVERY or env_flag("FORCE_REFRESH") or bootstrap
+    if due and api.seconds_left is not None and api.seconds_left < REFRESH_MIN_LEFT:
+        skipped.append("refresh")           # the next hour runs it; the lane tolerates 6 h
+        print("[pulse] out of time before the refresh")
+    elif due:
         try:
             refresh.run(api, st, main, win, t, authed)
             refreshed = 1
+            spent("refresh")
         except Exception as exc:  # a failed refresh must not lose the pulse
             refreshed = -1
             print(f"[refresh] failed: {exc!r}")
@@ -307,7 +379,8 @@ def run() -> None:
                 raise
     # one row per run, the evidence the health lanes are built from (stats/health.py)
     health.log_run(st, {"t": t, "hour": hour, "mode": meta["mode"], "requests": api.n_requests, "limited": api.n_limited,
-                        "n_window": meta["n_window"], "n_listed": meta["n_listed"], "seconds": now() - t, "refresh": refreshed})
+                        "n_window": meta["n_window"], "n_listed": meta["n_listed"], "seconds": now() - t, "refresh": refreshed,
+                        "skipped": ",".join(skipped), "served": api.n_served})
     if refreshed:                       # with the refresh, so the site is rebuilt every 4 hours, not hourly
         try:
             health.build_pulse(st, t)
@@ -318,7 +391,8 @@ def run() -> None:
     rawrepo.push_state("state-pulse", f"pulse {time.strftime('%Y-%m-%d %H:%M', time.gmtime(t))}")
     rawrepo.push_main(f"pulse {time.strftime('%Y-%m-%d %H', time.gmtime(t))}")
     flush_issues(Path("_issues"))
-    print(f"[pulse] done in {now() - t}s, {api.n_requests} requests")
+    print(f"[pulse] done in {now() - t}s, {api.n_served} answers, {api.n_limited} refusals"
+          + (f", cut: {', '.join(skipped)}" if skipped else ""))
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ period than usual); ``missing`` (no reading). ``why`` names the evidence:
 * ``spread``: one reading covers several hours or days, so its figures are averages;
 * ``partial``: a listing returned far fewer artworks than usual;
 * ``no_token``: collected without an account, so likes are not attributed to people;
+* ``budget``: the hour's reading time ran out before some phases (named in ``parts``);
 * ``reach``: only part of the catalog was readable (``reach`` holds the share);
 * ``skipped``: parts of the snapshot failed (``parts`` names them).
 
@@ -96,6 +97,10 @@ def pulse_lane(st: Path) -> List[Dict]:
     usual = g.n.rolling(168, min_periods=1).median().shift(1).fillna(g.n.median())
     runs = read_parquet(st / "runs.parquet")
     no_token = set(runs[runs["mode"] == "degraded"].hour.astype(int)) if runs is not None and "mode" in runs else set()
+    cut: Dict[int, str] = {}
+    if runs is not None and "skipped" in runs:
+        for r in runs[runs.skipped.fillna("") != ""].itertuples():
+            cut[int(r.hour)] = str(r.skipped)
     spans = []
     for hr in range(int(g.index.min()), int(g.index.max()) + HOUR, HOUR):
         s = {"a": hr, "b": hr + HOUR}
@@ -107,6 +112,8 @@ def pulse_lane(st: Path) -> List[Dict]:
                 s.update(level="degraded", why="partial", share=round(float(r.n / usual.loc[hr]), 2))
             elif hr in no_token:
                 s.update(level="degraded", why="no_token")
+            elif hr in cut:
+                s.update(level="degraded", why="budget", parts=cut[hr])
             elif r.spacing > SPREAD_HOURS:
                 s.update(level="degraded", why="spread", hours=round(float(r.spacing), 1))
             else:

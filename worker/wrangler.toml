@@ -6,7 +6,7 @@ compatibility_date = "2026-10-01"
 workers_dev = false
 
 [triggers]
-crons = ["17 * * * *", "43 5 * * *"]
+crons = ["17 * * * *", "43 5 * * *", "27 2 * * *"]
 
 [vars]
 REPO = "fabkury/servoom-stats"

@@ -1,10 +1,11 @@
 // Starts a GitHub Actions workflow of servoom-stats when a Cloudflare cron trigger fires.
-// The hourly trigger starts the pulse, the daily one the snapshot. Nothing else happens
+// The hourly trigger starts the pulse, the daily ones the snapshot and the probe. Nothing else happens
 // here: the workflows themselves decide whether there is work to do.
 
 const WORKFLOW = {
   '17 * * * *': 'pulse.yml',
   '43 5 * * *': 'snapshot.yml',
+  '27 2 * * *': 'probe.yml',
 };
 
 async function dispatch(env, workflow) {

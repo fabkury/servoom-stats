@@ -20,12 +20,19 @@ FILE_HOST = "https://f.divoom-gz.com"
 # three-hour crawl.
 OUTAGE = float(os.environ.get("API_OUTAGE_SECONDS", str(15 * 60)))
 RETRY_CAP = 60.0
-# Since 2026-10-12 the server serves one source at most 120 requests per clock minute and
-# answers the rest with 12 "Request data is null" (measured from GitHub runners on
-# 2026-10-13: the first refusal was always request #120 of the minute, at any rate from
-# 3 to 8 per second; 2 per second ran clean). Nothing may ask for more than this.
-MAX_RPS = float(os.environ.get("API_MAX_RPS", "2"))
-LIMITED_WAIT = 5.0             # pause after a 12, repeated until the minute window opens
+# Since 2026-10-23 about 01:30 UTC the server serves one source at most BUDGET requests
+# per sliding window of a minute, whatever the command, token or connection, and answers
+# the rest with HTTP 429 carrying the body of a ReturnCode 12 "Request data is null".
+# Refused requests count against the window too, so a client that retries quickly
+# starves itself. Measured from home on 2026-10-26 at 2 and 1 requests per second:
+# 30 served, then refusals until a minute after the first of them. From 2026-10-12 to
+# 2026-10-23 the budget was 120 per clock minute; see CLOUD_API.md.
+BUDGET = int(os.environ.get("API_BUDGET", "30"))
+WINDOW = float(os.environ.get("API_WINDOW_SECONDS", "62"))      # a little over the server's 60
+LIMITED_WAIT = WINDOW          # after a refusal the client stops for a whole window
+
+# Files come from a different host that has not shown a limit; they are paced apart.
+FILE_INTERVAL = float(os.environ.get("API_FILE_INTERVAL", "0.25"))
 
 # Commands this pipeline is allowed to send. Anything else is a programming error:
 # the collector must never call a command that changes server state.
@@ -43,25 +50,52 @@ class ApiDown(Exception):
     """The server or the network is failing; not the account's fault."""
 
 
+class OutOfTime(ApiDown):
+    """The job's reading budget is spent; whatever was read so far is kept."""
+
+
 class Api:
-    def __init__(self, rps: float = 4.0, workers: int = 4):
+    """One paced client. ``rps`` can only lower the rate below the server's budget."""
+
+    def __init__(self, rps: Optional[float] = None, workers: int = 4):
         self.s = requests.Session()
-        self.interval = 1.0 / min(rps, MAX_RPS)
+        self.interval = WINDOW / BUDGET
+        if rps:
+            self.interval = max(self.interval, 1.0 / rps)
         self.workers = workers
         self._lock = threading.Lock()
         self._next = 0.0
+        self._next_file = 0.0
         self.auth: Dict = {}
-        self.n_requests = 0
-        self.n_limited = 0
+        self.n_requests = 0            # attempts sent, refused ones included
+        self.n_served = 0              # answers with a body
+        self.n_limited = 0             # refusals (HTTP 429 or ReturnCode 12)
+        self.n_files = 0
         self._last_ok = time.monotonic()
+        self.deadline: Optional[float] = None
+
+    def set_budget(self, seconds: float) -> None:
+        """Requests sent after ``seconds`` from now raise OutOfTime instead."""
+        self.deadline = time.monotonic() + seconds
+
+    @property
+    def seconds_left(self) -> Optional[float]:
+        return None if self.deadline is None else self.deadline - time.monotonic()
 
     def _wait(self) -> None:
         with self._lock:
             now = time.monotonic()
             t = max(now, self._next)
+            if self.deadline is not None and t > self.deadline:
+                raise OutOfTime("reading budget spent")
             self._next = t + self.interval
         if t > now:
             time.sleep(t - now)
+
+    def _hold(self, seconds: float) -> None:
+        """Stop every worker for ``seconds``: the next request of any of them waits."""
+        with self._lock:
+            self._next = max(self._next, time.monotonic() + seconds)
 
     def post(self, cmd: str, body: Optional[Dict] = None, auth: bool = True) -> Dict:
         if cmd not in READ_ONLY:
@@ -75,15 +109,19 @@ class Api:
                 self.n_requests += 1
                 if r.status_code >= 500:
                     raise requests.HTTPError(f"HTTP {r.status_code}")
-                data = r.json()
-                if data.get("ReturnCode") == 12:        # over the per-minute budget: wait it out
+                limited = r.status_code == 429
+                data = None
+                if not limited:
+                    data = r.json()
+                    limited = data.get("ReturnCode") == 12
+                if limited:                      # over the window's budget: let it empty
                     self.n_limited += 1
                     if time.monotonic() - t0 > OUTAGE:
-                        raise ApiDown(f"{cmd}: rate-limited (12) for {OUTAGE:.0f}s")
-                    with self._lock:
-                        self._next = max(self._next, time.monotonic() + LIMITED_WAIT)
+                        raise ApiDown(f"{cmd}: rate-limited for {OUTAGE:.0f}s")
+                    self._hold(LIMITED_WAIT)
                     continue
                 self._last_ok = time.monotonic()
+                self.n_served += 1
                 return data
             except (requests.RequestException, ValueError) as exc:
                 t = time.monotonic()
@@ -92,16 +130,28 @@ class Api:
                 attempt += 1
                 time.sleep(min(RETRY_CAP, 2.0 ** attempt))
 
+    def _wait_file(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            t = max(now, self._next_file)
+            if self.deadline is not None and t > self.deadline:
+                raise OutOfTime("reading budget spent")
+            self._next_file = t + FILE_INTERVAL
+        if t > now:
+            time.sleep(t - now)
+
     def get_file(self, file_id: str) -> Optional[bytes]:
         for attempt in range(3):
-            self._wait()
+            self._wait_file()
             try:
                 r = self.s.get(f"{FILE_HOST}/{file_id}", timeout=60)
-                self.n_requests += 1
+                self.n_files += 1
                 if r.status_code == 200:
                     return r.content
                 if r.status_code == 404:
                     return None
+                if r.status_code == 429:
+                    self._next_file = time.monotonic() + LIMITED_WAIT
             except requests.RequestException:
                 pass
             time.sleep(2 ** attempt)
@@ -126,13 +176,16 @@ class Api:
     def crawl_list(self, classify: int, size: int, stop_before: Optional[int] = None,
                    max_pages: Optional[int] = None, transform: Optional[Callable] = None,
                    old_streak: int = 2) -> List:
-        """Page one (category, size) list in parallel waves.
+        """Page one (category, size) list in small waves.
 
         Lists are newest-first, but not strictly: some carry a block of about 120 much
         older artworks right after the first 60. So with ``stop_before`` the crawl ends
         only after ``old_streak`` consecutive pages hold nothing dated at or after it
         (5 pages clear such a block). Without it, it ends at the first empty page.
         ``self.last_gap`` tells whether an old page was followed by a newer one.
+
+        Waves no longer double: the client is paced well under one request a second,
+        so reading ahead buys no time and every page past the end is a wasted request.
         """
         out: List = []
         page, wave, streak, seen_old = 0, max(2, old_streak), 0, False
@@ -163,7 +216,6 @@ class Api:
             if done:
                 break
             page += wave
-            wave = min(wave * 2, 32)
         return out
 
     def like_list(self, gid: int, n: int, cap_pages: int = 5) -> Optional[List[Dict]]:

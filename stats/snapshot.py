@@ -1,5 +1,20 @@
-"""Daily snapshot: the whole public catalog, who gave each new like, new files, vanished
-artworks, top-artist profiles and Divoom's calendar. Then ``data/daily`` is rebuilt.
+"""Snapshot every two days: the whole public catalog, who gave each new like, new files,
+vanished artworks, top-artist profiles and Divoom's calendar. Then ``data/daily`` is
+rebuilt.
+
+Since 2026-10-23 Divoom serves one source 30 requests a minute, so a full reading no
+longer fits one job. The workflow runs three stages (``python -m stats.snapshot <stage>``):
+
+* ``prepare``: decides whether a reading is due or one is in progress, and logs the
+  polling account in, once, so the other stages can reuse its token;
+* ``crawl --shard k``: one of SHARDS parallel jobs, each on its own runner (its own
+  request budget). It reads every SHARDS-th list, checkpoints to the branch
+  ``state-crawl-<k>`` every 20 minutes, then reads the like lists and comments of its
+  own rows whose counters moved. When its time budget ends it saves and stops; the
+  next run of the workflow resumes it;
+* ``finish``: when every shard is complete, merges them into the reading, asks about
+  vanished artworks, decodes new files, polls the top artists, rebuilds ``data/daily``
+  and persists the state. Otherwise it asks the workflow to run again.
 """
 
 from __future__ import annotations
@@ -16,7 +31,7 @@ import pandas as pd
 
 from . import daily, files, health, rawrepo
 from .accounts import Halted, Pool, flush_issues, note_issue
-from .api import Api, ApiDown
+from .api import Api, ApiDown, OutOfTime
 from .util import (ALL_SIZES, CATEGORIES, CONFIG, DATA, DAY, PHOTO, ROW_FIELDS, add_rollup, day_of, env_flag,
                    fingerprint, is_auto, load_ranges, now, read_parquet, script_of, tier, write_parquet)
 
@@ -56,46 +71,84 @@ def list_plan() -> list:
         [(c, s) for c in CATEGORIES for s in ALL_SIZES]
 
 
-def crawl(api: Api, col: Collector, lists: list, seed: Optional[pd.DataFrame] = None, start: int = 0,
-          save=None) -> pd.DataFrame:
-    """Read ``lists[start:]``; ``seed`` holds the raw rows of the lists before ``start``.
+SHARDS = int(os.environ.get("SNAPSHOT_SHARDS", "4"))
+BUDGET = int(os.environ.get("SNAPSHOT_BUDGET_SECONDS", str(320 * 60)))           # a crawl shard
+FINISH_BUDGET = int(os.environ.get("SNAPSHOT_FINISH_BUDGET_SECONDS", str(270 * 60)))
+# A checkpoint is usable while it is younger than this, counted from its save (not
+# from the crawl's start: until 2026-10-26 it was, and with two triggers seven hours
+# apart every run began at list 0). A crawl may thus continue over chained runs.
+CHECKPOINT_MAX_AGE = 48 * 3600
+# The catalog is read every two days (decided 2026-10-09 to halve the request volume
+# per polling account). The worker still dispatches daily; a run sooner than this
+# after the last snapshot exits at once unless a crawl is in progress.
+SNAPSHOT_GAP = int(os.environ.get("SNAPSHOT_MIN_GAP_HOURS", "36")) * 3600
+CHECKPOINT_EVERY = 20 * 60
+LIKE_LISTS = 20000              # artworks whose new likers are read, per reading, by size of the rise
+COMMENTS = 3000
 
-    With ``save``, the raw rows read so far are checkpointed every CHECKPOINT_EVERY
-    seconds, so a run that dies (the first list alone takes over an hour) can resume.
+
+def shard_lists(lists: list, shard: int) -> list:
+    return lists[shard::SHARDS]
+
+
+def ck_branch(shard: int) -> str:
+    return f"state-crawl-{shard}"
+
+
+def output(key: str, value: str) -> None:
+    """A step output for the workflow (no-op outside GitHub Actions)."""
+    path = os.environ.get("GITHUB_OUTPUT")
+    if path:
+        with open(path, "a") as f:
+            f.write(f"{key}={value}\n")
+    print(f"[snapshot] {key}={value}")
+
+
+def crawl(api: Api, col: Collector, lists: list, seed: Optional[pd.DataFrame] = None, start: int = 0,
+          save=None):
+    """Read ``lists[start:]``; ``seed`` holds the raw rows of the lists before ``start``.
+    Returns (rows, done, complete): the raw rows read, how many lists are finished, and
+    whether that is all of them. With ``save``, the raw rows are checkpointed every
+    CHECKPOINT_EVERY seconds. The reading budget ending stops the crawl at a list
+    boundary; the lists after it wait for the next run.
     """
     frames = [seed] if seed is not None and len(seed) else []
-    rows, t0, t_save = [], now(), now()
+    rows, t0, t_save, done = [], now(), now(), start
     for i in range(start, len(lists)):
         cls, size = lists[i]
-        rows += api.crawl_list(cls, size, transform=col.take)
-        if i % 20 == 0:
+        try:
+            rows += api.crawl_list(cls, size, transform=col.take)
+        except OutOfTime:
+            print(f"[snapshot] out of time at list {i}/{len(lists)}", flush=True)
+            break
+        done = i + 1
+        if i % 10 == 0:
             print(f"[snapshot] list {i}/{len(lists)}, {len(rows) + sum(map(len, frames))} rows, "
-                  f"{api.n_requests} requests, {now() - t0}s", flush=True)
-        if save is not None and i + 1 < len(lists) and now() - t_save >= CHECKPOINT_EVERY:
+                  f"{api.n_served} answers, {api.n_limited} refusals, {now() - t0}s", flush=True)
+        if save is not None and done < len(lists) and now() - t_save >= CHECKPOINT_EVERY:
             if rows:
                 frames.append(pd.DataFrame(rows, columns=INT))
                 rows = []
-            save(pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(rows, columns=INT),
-                 col, i + 1, len(lists))
+            save(pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(rows, columns=INT), col, done, len(lists))
             t_save = now()
     if rows:                               # empty frames are left out so the int columns keep their dtype
         frames.append(pd.DataFrame(rows, columns=INT))
-    df = (pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(rows, columns=INT)).drop_duplicates("gid")
+    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(rows, columns=INT)
+    return df, done, done >= len(lists)
+
+
+def finish_rows(raw: pd.DataFrame) -> pd.DataFrame:
+    df = raw.drop_duplicates("gid")
     return df[df.priv == 0].drop(columns=["priv"]).reset_index(drop=True)
 
 
-CHECKPOINT_MAX_AGE = 6 * 3600
-# The catalog is read every two days (decided 2026-10-09 to halve the request volume
-# per polling account). The worker still dispatches daily; a run sooner than this
-# after the last snapshot exits at once.
-SNAPSHOT_GAP = int(os.environ.get("SNAPSHOT_MIN_GAP_HOURS", "36")) * 3600
-CHECKPOINT_EVERY = 20 * 60
-
-
-def save_checkpoint(cur: pd.DataFrame, col: Collector, done: int, total: int, branch: str = "state-crawl") -> None:
-    """Keep the crawl in the private repository: the raw rows of the first ``done`` of
-    ``total`` lists while it runs, the finished table at the end. A run that dies resumes
-    from it instead of reading the catalog again for three hours."""
+def save_checkpoint(cur: pd.DataFrame, col: Collector, done: int, total: int, shard: int = 0,
+                    extra: Optional[dict] = None, info_extra: Optional[dict] = None) -> None:
+    """Keep the shard's crawl in the private repository: the raw rows of the first
+    ``done`` of ``total`` lists while it runs, the finished table plus the like events
+    and comments (``extra``) at the end. A run that dies or runs out of time resumes
+    from it instead of reading the lists again."""
+    branch = ck_branch(shard)
     try:
         ck = rawrepo.WORK / branch
         if not ck.exists():
@@ -107,27 +160,30 @@ def save_checkpoint(cur: pd.DataFrame, col: Collector, done: int, total: int, br
         write_parquet(pd.DataFrame([(u, *v) for u, v in col.users.items()], columns=["uid", "name", "cc", "level", "amb", "head"]), ck / "users.parquet")
         write_parquet(pd.DataFrame(col.meta, columns=["gid", "uid", "date", "tags", "at"]), ck / "meta.parquet")
         (ck / "fids.json").write_text(json.dumps(col.fids))
-        (ck / "info.json").write_text(json.dumps({"t": col.t, "rows": int(len(cur)), "done": done, "total": total}))
-        rawrepo.push_state(branch, f"crawl checkpoint {day_of(col.t)}" + ("" if done >= total else f" ({done}/{total} lists)"))
-        print(f"[snapshot] crawl checkpoint saved, {len(cur)} rows, {done}/{total} lists")
+        for name, df in (extra or {}).items():
+            write_parquet(df, ck / f"{name}.parquet")
+        info = {"t": col.t, "saved": now(), "rows": int(len(cur)), "done": done, "total": total,
+                "shard": shard, "shards": SHARDS, **(info_extra or {})}
+        (ck / "info.json").write_text(json.dumps(info))
+        rawrepo.push_state(branch, f"crawl checkpoint {day_of(col.t)} shard {shard}" + ("" if done >= total else f" ({done}/{total} lists)"))
+        print(f"[snapshot] crawl checkpoint saved, {len(cur)} rows, {done}/{total} lists", flush=True)
     except Exception as exc:                 # a checkpoint is a convenience; never fail the run for it
         print(f"[snapshot] could not save the crawl checkpoint: {exc!r}")
 
 
-def load_checkpoint(now_t: int, last_t: int, total: int, branch: str = "state-crawl"):
-    """A saved crawl that is recent and was not yet turned into a snapshot, or None.
-    Returns (rows, collector, t, done): the finished table when ``done == total``, else
-    the raw rows of the first ``done`` lists."""
+def load_checkpoint(now_t: int, last_t: int, total: int, shard: int = 0) -> Optional[dict]:
+    """The shard's saved crawl when it is recent, newer than the last snapshot and made
+    with the same plan; else None. ``cur`` holds the raw rows of the first ``done`` lists,
+    or the finished table (with ``events`` and ``comments``) when ``done == total``."""
     try:
-        ck = rawrepo.clone_state(branch)
+        ck = rawrepo.clone_state(ck_branch(shard))
         info_file = ck / "info.json"
         if not info_file.exists():
             return None
         info = json.loads(info_file.read_text())
-        if now_t - info["t"] > CHECKPOINT_MAX_AGE or info["t"] <= last_t:
+        if now_t - info.get("saved", info["t"]) > CHECKPOINT_MAX_AGE or info["t"] <= last_t:
             return None
-        done = info.get("done", total)
-        if info.get("total", total) != total:     # the plan changed; a partial crawl is useless
+        if info.get("total", total) != total or info.get("shards", SHARDS) != SHARDS:   # the plan changed
             return None
         cur = pd.read_parquet(ck / "crawl.parquet")
         if len(cur) != info["rows"]:
@@ -138,7 +194,11 @@ def load_checkpoint(now_t: int, last_t: int, total: int, branch: str = "state-cr
         col.fids = {int(k): v for k, v in json.loads((ck / "fids.json").read_text()).items()}
         mt = pd.read_parquet(ck / "meta.parquet")
         col.meta = [(g, uid, d, list(tags), [int(x) for x in at]) for g, uid, d, tags, at in mt.itertuples(index=False, name=None)]
-        return cur, col, info["t"], min(done, total)
+        out = {"cur": cur, "col": col, "t": info["t"], "done": min(info.get("done", total), total), "info": info}
+        for name in ("events", "comments"):
+            f = ck / f"{name}.parquet"
+            out[name] = pd.read_parquet(f) if f.exists() else None
+        return out
     except Exception as exc:
         print(f"[snapshot] crawl checkpoint not usable: {exc!r}")
         return None
@@ -150,8 +210,8 @@ def pulse_events(main: Path, since: int) -> pd.DataFrame:
     return ev[ev.t > since]
 
 
-def fetch_events(api: Api, m: pd.DataFrame, t: int) -> pd.DataFrame:
-    todo = m[(m.dl > 0) & (m.date < t - 30 * DAY) & (~m.isnew)].sort_values("dl", ascending=False).head(20000)
+def fetch_events(api: Api, m: pd.DataFrame, t: int, cap: int = LIKE_LISTS) -> pd.DataFrame:
+    todo = m[(m.dl > 0) & (m.date < t - 30 * DAY) & (~m.isnew)].sort_values("dl", ascending=False).head(cap)
     ranges = load_ranges()
 
     def one(row):
@@ -166,8 +226,8 @@ def fetch_events(api: Api, m: pd.DataFrame, t: int) -> pd.DataFrame:
     return ev
 
 
-def fetch_comments(api: Api, m: pd.DataFrame, t: int, since: int, salt: str) -> pd.DataFrame:
-    todo = m[(m.dc > 0) & (m.date < t - 30 * DAY) & (~m.isnew)].gid.head(3000).tolist()
+def fetch_comments(api: Api, m: pd.DataFrame, t: int, since: int, salt: str, cap: int = COMMENTS) -> pd.DataFrame:
+    todo = m[(m.dc > 0) & (m.date < t - 30 * DAY) & (~m.isnew)].sort_values("dc", ascending=False).gid.head(cap).tolist()
     rows = []
     for gid, cl in zip(todo, api.pmap(api.comments, todo)):
         for c in cl:
@@ -186,7 +246,7 @@ def check_vanished(api: Api, cat: pd.DataFrame, seen: set, t: int) -> pd.DataFra
     absent = (cat.gone == 0) & ~cat.gid.isin(seen)
     cat.loc[absent, "miss"] = cat.loc[absent, "miss"] + 1
     cat.loc[~absent & (cat.gone == 0), "miss"] = 0
-    todo = cat[absent & (cat.miss >= 2)].gid.head(4000).tolist()
+    todo = cat[absent & (cat.miss >= 2)].gid.head(1500).tolist()
     rows = []
     for gid, r in zip(todo, api.pmap(api.gallery_info, todo)):
         if r.get("ReturnCode") == 11:
@@ -373,46 +433,136 @@ def detect_automation(ev: pd.DataFrame) -> None:
                            "`config/automated_ranges.json`.")
 
 
-def run() -> None:
+def enrich(api: Api, cur: pd.DataFrame, st: Path, main: Path, t: int, since: int):
+    """The newest likers and the comments of this shard's rows whose counters rose since
+    the last snapshot, as far as the budget goes: (events, comments, partial)."""
+    empty_ev = pd.DataFrame(columns=["gid", "liker", "t", "t_prev", "auto"])
+    empty_cm = pd.DataFrame(columns=["gid", "cid", "uid", "date", "fp", "len", "script", "robot", "auto"])
+    prev = read_parquet(st / "catalog.parquet", columns=["gid", "like", "cmt", "t"])
+    if prev is None or not len(cur):
+        return empty_ev, empty_cm, False
+    m = cur.merge(prev.rename(columns={"like": "like_p", "cmt": "cmt_p", "t": "t_p"}), on="gid", how="left")
+    m["isnew"] = m.like_p.isna()
+    m["dl"] = (m.like - m.like_p.fillna(0)).clip(lower=0).astype("int64")
+    m["dc"] = (m.cmt - m.cmt_p.fillna(0)).clip(lower=0).astype("int64")
+    m["t_p"] = m.t_p.fillna(m.date).astype("int64")
+    ev = fetch_events(api, m, t, cap=LIKE_LISTS // SHARDS)
+    partial = api.seconds_left is not None and api.seconds_left <= 0
+    try:
+        salt = (main / "state" / "salt.txt").read_text().strip()
+        cm = fetch_comments(api, m, t, since, salt, cap=COMMENTS // SHARDS)
+    except OutOfTime:
+        cm, partial = empty_cm, True
+    return ev, cm, partial
+
+
+def run_prepare() -> None:
+    """Stage 1: is a reading due, or in progress? Then log the account in, once."""
     t = now()
     st = rawrepo.clone_state("state-snap")
-    days = [time.strftime("%Y/%m/%d", time.gmtime(t - k * DAY)) for k in range(3)]
-    main = rawrepo.clone_main(["state"] + [f"obs/pulse/{d}" for d in days])
+    main = rawrepo.clone_main(["state"])
     lastf = st / "last_snapshot.json"
     last = json.loads(lastf.read_text()) if lastf.exists() else {}
-    if t - last.get("t", 0) < SNAPSHOT_GAP and not env_flag("FORCE_SNAPSHOT"):
+    lists = list_plan()
+    in_progress = [i for i in range(SHARDS) if load_checkpoint(t, last.get("t", 0), len(shard_lists(lists, i)), i)]
+    if in_progress:
+        print(f"[snapshot] a reading is in progress (shards {in_progress} have checkpoints)")
+    elif t - last.get("t", 0) < SNAPSHOT_GAP and not env_flag("FORCE_SNAPSHOT"):
         print(f"[snapshot] the last snapshot is {(t - last['t']) // 3600} hours old, under "
               f"{SNAPSHOT_GAP // 3600}; nothing to do")
+        output("go", "false")
         return
-    # Deep pages answer slowly, so many workers are needed to reach the request rate.
-    api = Api(rps=float(os.environ.get("SNAPSHOT_RPS", "8")), workers=24)
+    api = Api(workers=2)
     try:
         Pool(main).acquire(api, "snapshot")
     except Halted as exc:
         print(f"[snapshot] halted: {exc}")
         rawrepo.push_main("snapshot: halted")
         flush_issues(Path("_issues"))
+        output("go", "false")
         return
-    rawrepo.push_main("snapshot: account state")       # token and strikes, before the long crawl
+    rawrepo.push_main("snapshot: account state")       # token and strikes, for the other stages
+    flush_issues(Path("_issues"))
+    output("go", "true")
 
+
+def run_crawl(shard: int) -> None:
+    """Stage 2, one of SHARDS parallel jobs: read this shard's lists, then enrich them."""
+    t = now()
+    st = rawrepo.clone_state("state-snap")
+    main = rawrepo.clone_main(["state"])
+    lastf = st / "last_snapshot.json"
+    last = json.loads(lastf.read_text()) if lastf.exists() else {}
     since = last.get("t", 0)
-    partial = bool(os.environ.get("LIMIT_LISTS"))
-    lists = list_plan()
-    saved = None if partial or env_flag("NO_CHECKPOINT") else load_checkpoint(t, since, len(lists))
-    if saved and saved[3] >= len(lists):
-        cur, col, t, _ = saved         # the snapshot is dated at the time of the crawl it reuses
-        print(f"[snapshot] reusing the crawl of {time.strftime('%Y-%m-%d %H:%M', time.gmtime(t))} UTC, {len(cur)} rows")
+    api = Api(workers=4)
+    api.set_budget(BUDGET)
+    Pool(main).token_for(api, "snapshot")
+    lists = shard_lists(list_plan(), shard)
+    saved = load_checkpoint(t, since, len(lists), shard)
+    if saved and saved["done"] >= len(lists):
+        print(f"[snapshot] shard {shard} is complete; nothing to do")
+        return
+    if saved:
+        seed, col, t, done = saved["cur"], saved["col"], saved["t"], saved["done"]
+        print(f"[snapshot] shard {shard} resumes the crawl of {time.strftime('%Y-%m-%d %H:%M', time.gmtime(t))} UTC "
+              f"at list {done}/{len(lists)}, {len(seed)} rows so far")
     else:
-        seed, done = None, 0
-        if saved:
-            seed, col, t, done = saved
-            print(f"[snapshot] resuming the crawl of {time.strftime('%Y-%m-%d %H:%M', time.gmtime(t))} UTC "
-                  f"at list {done}/{len(lists)}, {len(seed)} rows so far")
-        else:
-            col = Collector(t)
-        cur = crawl(api, col, lists, seed, done, save=None if partial else save_checkpoint)
-        if not partial:
-            save_checkpoint(cur, col, len(lists), len(lists))
+        seed, col, done = None, Collector(t), 0
+        print(f"[snapshot] shard {shard} reads {len(lists)} lists")
+    raw, done, complete = crawl(api, col, lists, seed, done,
+                                save=lambda cur, c, d, n: save_checkpoint(cur, c, d, n, shard))
+    if not complete:
+        save_checkpoint(raw, col, done, len(lists), shard)
+        print(f"[snapshot] shard {shard} stops at list {done}/{len(lists)}; the next run continues")
+        return
+    cur = finish_rows(raw)
+    ev, cm, partial = enrich(api, cur, st, main, t, since)
+    save_checkpoint(cur, col, len(lists), len(lists), shard, extra={"events": ev, "comments": cm},
+                    info_extra={"enrich_partial": int(partial), "requests": api.n_requests})
+    print(f"[snapshot] shard {shard} done: {len(cur)} artworks, {len(ev)} like events, {len(cm)} comments, "
+          f"{api.n_served} answers, {api.n_limited} refusals" + (", enrichment cut by the budget" if partial else ""))
+
+
+def run_finish() -> None:
+    """Stage 3: merge the shards into the reading, or ask for another run."""
+    t0 = now()
+    st = rawrepo.clone_state("state-snap")
+    days = [time.strftime("%Y/%m/%d", time.gmtime(t0 - k * DAY)) for k in range(3)]
+    main = rawrepo.clone_main(["state"] + [f"obs/pulse/{d}" for d in days])
+    lastf = st / "last_snapshot.json"
+    last = json.loads(lastf.read_text()) if lastf.exists() else {}
+    since = last.get("t", 0)
+    lists = list_plan()
+    parts = []
+    for i in range(SHARDS):
+        ck = load_checkpoint(t0, since, len(shard_lists(lists, i)), i)
+        if ck is None or ck["done"] < len(shard_lists(lists, i)):
+            where = "has no usable checkpoint" if ck is None else f"stopped at list {ck['done']}/{len(shard_lists(lists, i))}"
+            print(f"[snapshot] shard {i} {where}; the reading continues in the next run")
+            output("continue", "true")
+            return
+        parts.append(ck)
+    t = max(ck["t"] for ck in parts)
+    cur = pd.concat([ck["cur"] for ck in parts], ignore_index=True).drop_duplicates("gid").reset_index(drop=True)
+    col = Collector(t)
+    for ck in parts:
+        col.users.update(ck["col"].users)
+        col.fids.update(ck["col"].fids)
+        col.meta += ck["col"].meta
+    ev_old = pd.concat([ck["events"] for ck in parts if ck["events"] is not None], ignore_index=True) \
+        if any(ck["events"] is not None for ck in parts) else pd.DataFrame(columns=["gid", "liker", "t", "t_prev", "auto"])
+    cm = pd.concat([ck["comments"] for ck in parts if ck["comments"] is not None], ignore_index=True) \
+        if any(ck["comments"] is not None for ck in parts) else pd.DataFrame()
+    print(f"[snapshot] merged {SHARDS} shards: {len(cur)} artworks read at {time.strftime('%Y-%m-%d %H:%M', time.gmtime(t))} UTC, "
+          f"{len(ev_old)} like events, {len(cm)} comments")
+    api = Api(workers=4)
+    api.set_budget(FINISH_BUDGET)
+    try:
+        Pool(main).token_for(api, "snapshot")
+    except Halted as exc:
+        print(f"[snapshot] finishing without a token: {exc}")
+    partial = bool(os.environ.get("LIMIT_LISTS"))
+    shard_requests = sum(int(ck["info"].get("requests", 0)) for ck in parts)
     prev = read_parquet(st / "catalog.parquet")
     bootstrap = prev is None
     if bootstrap:
@@ -429,8 +579,7 @@ def run() -> None:
     m["to_new"] = ((m.new == 1) & ((m.new_p == 0) | fresh)).astype(int)
     m["refiled"] = (~m.isnew & (m.cls != m.cls_p)).astype(int)
 
-    # who gave the new likes
-    ev_old = fetch_events(api, m, t) if not bootstrap else pd.DataFrame(columns=["gid", "liker", "t", "t_prev", "auto"])
+    # who gave the new likes (read by the crawl shards)
     ev = pd.concat([pulse_events(main, since), ev_old], ignore_index=True).drop_duplicates(["gid", "liker", "t"])
     per = ev.groupby("gid").auto.agg(["sum", "count"]) if len(ev) else pd.DataFrame(columns=["sum", "count"])
     m["dla"] = np.minimum(m.gid.map(per["sum"]).fillna(0), m.dl).astype("int64")
@@ -462,10 +611,16 @@ def run() -> None:
         users = pd.concat([users, pu[~pu.uid.isin(users.uid)]], ignore_index=True)
 
     ctx = {"t": t, "since": since, "bootstrap": bootstrap, "partial": partial, "warnings": []}
+    if any(ck["info"].get("enrich_partial") for ck in parts):
+        ctx["warnings"].append("likes")          # some like lists were not read: budget
 
     def step(name, fn, default=None):
         try:
             return fn()
+        except OutOfTime:                        # the budget ended inside this part
+            print(f"[snapshot] {name} cut by the budget")
+            ctx["warnings"].append(name)
+            return default
         except ApiDown:
             raise
         except Exception as exc:                 # one failed part must not lose the snapshot
@@ -475,8 +630,6 @@ def run() -> None:
                 raise
             return default
 
-    salt = (main / "state" / "salt.txt").read_text().strip()
-    cm = step("comments", lambda: fetch_comments(api, m, t, since, salt), pd.DataFrame()) if not bootstrap else pd.DataFrame()
     vanished = step("vanished", lambda: check_vanished(api, cat, set(cur.gid), t), pd.DataFrame()) if not (bootstrap or partial) else pd.DataFrame()
     new = m[m.isnew & (m.date > t - 3 * DAY)]
     fd = step("files", lambda: process_files(api, st, new, col.fids, t), pd.DataFrame())
@@ -531,26 +684,44 @@ def run() -> None:
         write_parquet(newmeta, obs / "meta.parquet")
 
     # build the public aggregates, then persist state
-    ctx.update(requests=api.n_requests, prev_last=prev_last, ev=ev, cm=cm, top=top, m=m)
+    ctx.update(requests=api.n_requests + shard_requests, prev_last=prev_last, ev=ev, cm=cm, top=top, m=m)
     step("build", lambda: daily.build(st, cat, users, acc, meta, ctx))
     # one row per run, the evidence the health lanes are built from (stats/health.py)
     health.log_run(st, {"t": t, "since": since, "rows": int(len(cur)), "catalog": int((cat.gone == 0).sum()),
-                        "requests": api.n_requests, "limited": api.n_limited, "partial": int(partial),
+                        "requests": api.n_requests + shard_requests, "limited": api.n_limited, "partial": int(partial),
                         "warnings": ",".join(ctx["warnings"]), "seconds": now() - t})
     step("health", lambda: health.build_snapshot(st, t))
     write_parquet(cat, st / "catalog.parquet")
     write_parquet(users, st / "users.parquet")
     write_parquet(meta, st / "meta_recent.parquet")
-    lastf.write_text(json.dumps({"t": t, "rows": int(len(cur)), "requests": api.n_requests, "warnings": ctx["warnings"]}))
+    lastf.write_text(json.dumps({"t": t, "rows": int(len(cur)), "requests": api.n_requests + shard_requests, "warnings": ctx["warnings"]}))
     rawrepo.push_state("state-snap", f"snapshot {day_of(t)}")
     rawrepo.push_main(f"snapshot {day_of(t)}")
     flush_issues(Path("_issues"))
-    print(f"[snapshot] done in {now() - t}s, {api.n_requests} requests, {len(cur)} artworks, warnings {ctx['warnings']}")
+    output("continue", "false")
+    print(f"[snapshot] done in {now() - t}s from the crawl's start, {api.n_requests + shard_requests} requests, "
+          f"{len(cur)} artworks, warnings {ctx['warnings']}")
 
 
-if __name__ == "__main__":
+def main() -> None:
+    args = sys.argv[1:]
+    stage = args[0] if args else "finish"
     try:
-        run()
+        if stage == "prepare":
+            run_prepare()
+        elif stage == "crawl":
+            run_crawl(int(args[args.index("--shard") + 1]) if "--shard" in args else 0)
+        elif stage == "finish":
+            run_finish()
+        else:
+            raise SystemExit(f"unknown stage {stage}; use prepare, crawl --shard N or finish")
+    except Halted as exc:
+        print(f"[snapshot] halted: {exc}")
+        sys.exit(1)
     except ApiDown as exc:
         print(f"[snapshot] server unreachable: {exc}")
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

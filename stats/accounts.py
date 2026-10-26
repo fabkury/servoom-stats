@@ -183,6 +183,20 @@ class Pool:
             api.auth = auth
 
     # -- entry point --------------------------------------------------------
+    def token_for(self, api: Api, role: str) -> Dict:
+        """Authenticate ``api`` with the stored token of the ``role`` account, without a
+        login or a health check: for the jobs that run beside the one that acquired it
+        (the snapshot's crawl shards, the daily probe). A login would invalidate the
+        token the other jobs hold. Raises Halted when there is none."""
+        if self.health().get("halted"):
+            raise Halted(self.health().get("reason", "halted"))
+        for a in self.accounts():
+            if a.get("role") == role and a.get("status") == "ok" and a.get("token"):
+                _mask(a.get("password"), a.get("md5"), a.get("email"), a.get("token"))
+                api.auth = {"Token": a["token"], "UserId": a["user_id"]}
+                return a
+        raise Halted(f"no token for the {role} role")
+
     def acquire(self, api: Api, role: str) -> Dict:
         """Authenticate ``api`` for a job. Raises Halted when no account can be used."""
         if self.health().get("halted"):

@@ -1,12 +1,22 @@
 name: snapshot
 
+# The catalog is read every two days. Since Divoom's budget of 30 requests a minute
+# per source (2026-10-23) one reading takes several runners: `prepare` logs the
+# account in, `crawl` reads the lists in SNAPSHOT_SHARDS parallel jobs (each with its
+# own budget and checkpoints), `finish` merges them and builds the data. A shard that
+# runs out of time saves its checkpoint; `finish` then starts another run of this
+# workflow, which resumes the shards (at most CHAIN_MAX runs per reading).
+
 on:
   schedule:
     # Fallback only: a Cloudflare Worker starts this workflow at 05:43 UTC (worker/).
-    # The catalog is read every two days: a run within 36 hours of the previous
-    # snapshot exits at once (SNAPSHOT_MIN_GAP_HOURS in stats/snapshot.py).
-    - cron: '13 7,9,11 * * *'
+    - cron: '13 9 * * *'
   workflow_dispatch:
+    inputs:
+      hop:
+        description: 'Run number within one reading (set by the workflow itself)'
+        type: number
+        default: 0
 
 permissions:
   contents: read
@@ -15,14 +25,80 @@ concurrency:
   group: snapshot
   cancel-in-progress: false
 
+env:
+  SNAPSHOT_SHARDS: 4
+  CHAIN_MAX: 5
+  PYTHONUNBUFFERED: 1
+  ACCOUNT_EMAIL_DOMAIN: ${{ vars.ACCOUNT_EMAIL_DOMAIN }}
+
 jobs:
-  snapshot:
+  prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    timeout-minutes: 20
+    environment: polling
+    permissions:
+      contents: read
+      issues: write
+    outputs:
+      go: ${{ steps.prepare.outputs.go }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -q -r requirements.txt
+      - name: Decide and log in
+        id: prepare
+        env:
+          RAW_REPO_DEPLOY_KEY: ${{ secrets.RAW_REPO_DEPLOY_KEY }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$RAW_REPO_DEPLOY_KEY" > ~/.ssh/raw_key && chmod 600 ~/.ssh/raw_key
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/raw_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          python -m stats.snapshot prepare
+      - name: Open issues
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/issues.sh
+
+  crawl:
+    needs: prepare
+    if: needs.prepare.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    environment: polling
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -q -r requirements.txt
+      - name: Read the lists of shard ${{ matrix.shard }}
+        env:
+          RAW_REPO_DEPLOY_KEY: ${{ secrets.RAW_REPO_DEPLOY_KEY }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$RAW_REPO_DEPLOY_KEY" > ~/.ssh/raw_key && chmod 600 ~/.ssh/raw_key
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/raw_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          python -m stats.snapshot crawl --shard ${{ matrix.shard }}
+
+  finish:
+    needs: [prepare, crawl]
+    if: always() && needs.prepare.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
     environment: polling
     permissions:
       contents: write
       issues: write
+      actions: write
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
@@ -32,15 +108,15 @@ jobs:
       - run: pip install -q -r requirements.txt -r requirements-snapshot.txt
       - name: Check the decoders import
         run: python -c "from servoom import PixelBeanDecoder; print('decoders ok')"
-      - name: Poll
+      - name: Merge the shards and build
+        id: finish
         env:
           RAW_REPO_DEPLOY_KEY: ${{ secrets.RAW_REPO_DEPLOY_KEY }}
-          ACCOUNT_EMAIL_DOMAIN: ${{ vars.ACCOUNT_EMAIL_DOMAIN }}
         run: |
           install -m 700 -d ~/.ssh
           printf '%s\n' "$RAW_REPO_DEPLOY_KEY" > ~/.ssh/raw_key && chmod 600 ~/.ssh/raw_key
           export GIT_SSH_COMMAND="ssh -i ~/.ssh/raw_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
-          python -m stats.snapshot
+          python -m stats.snapshot finish
       - name: Publish data
         id: publish
         run: bash scripts/publish.sh "snapshot"
@@ -50,6 +126,19 @@ jobs:
           CF_DEPLOY_HOOK_URL: ${{ secrets.CF_DEPLOY_HOOK_URL }}
         run: |
           if [ -n "$CF_DEPLOY_HOOK_URL" ]; then curl -fsS -X POST "$CF_DEPLOY_HOOK_URL" -o /dev/null && echo "site build requested"; else echo "no deploy hook configured"; fi
+      - name: Continue the reading in another run
+        if: steps.finish.outputs.continue == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HOP: ${{ inputs.hop || 0 }}
+        run: |
+          next=$((HOP + 1))
+          if [ "$next" -ge "$CHAIN_MAX" ]; then
+            echo "::error::the reading did not complete in $CHAIN_MAX runs; it resumes at the next scheduled run"
+            exit 1
+          fi
+          gh workflow run snapshot.yml --ref main -f hop="$next"
+          echo "run $next of the reading requested"
       - name: Open issues
         if: always()
         env:

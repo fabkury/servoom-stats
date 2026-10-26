@@ -3,9 +3,9 @@ name: pulse
 on:
   schedule:
     # Fallback only: a Cloudflare Worker starts this workflow at :17 every hour (worker/).
-    # GitHub's own schedule is often late or dropped; a run within 40 minutes of the
-    # previous pulse exits at once.
-    - cron: '32,52 * * * *'
+    # GitHub's own schedule is often late or dropped; a run within 50 minutes of the
+    # previous pulse exits at once. One fallback a hour: a pulse now takes most of it.
+    - cron: '47 * * * *'
   workflow_dispatch:
     inputs:
       refresh:
@@ -40,6 +40,7 @@ jobs:
           RAW_REPO_DEPLOY_KEY: ${{ secrets.RAW_REPO_DEPLOY_KEY }}
           ACCOUNT_EMAIL_DOMAIN: ${{ vars.ACCOUNT_EMAIL_DOMAIN }}
           FORCE_REFRESH: ${{ inputs.refresh && '1' || '' }}
+          PYTHONUNBUFFERED: 1
         run: |
           install -m 700 -d ~/.ssh
           printf '%s\n' "$RAW_REPO_DEPLOY_KEY" > ~/.ssh/raw_key && chmod 600 ~/.ssh/raw_key
