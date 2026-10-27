@@ -10,7 +10,7 @@ takes over (``pulse.apply_probe``):
   lists that carry a block of old artworks after the newest ones, are found;
 * ``categories.json``: the total items per category (``refresh.poll_categories``);
 * ``held.parquet``: the outcome of uploads that were held for review
-  (``gid, chk_final, t_res``).
+  (``gid, chk_final, t_res``); the refresh job, which owns the walk table, takes it over.
 
 It reuses the snapshot account's token; without one it reads anonymously (shallower
 lists, no held follow-up).
@@ -60,9 +60,9 @@ def survey_lists(api: Api, st: Path, t: int, cutoff: int) -> bool:
     return complete
 
 
-def follow_up_held(api: Api, st: Path, sp: Path, t: int) -> None:
-    """Re-read uploads the pulse saw held for review, to record the outcome."""
-    w = read_parquet(sp / "walk.parquet")
+def follow_up_held(api: Api, st: Path, rf: Path, t: int) -> None:
+    """Re-read uploads the id walk saw held for review, to record the outcome."""
+    w = read_parquet(rf / "walk.parquet")
     if w is None or not len(w):
         return
     done = read_parquet(st / "held.parquet")
@@ -88,7 +88,7 @@ def run() -> None:
         print(f"[probe] the last probe was {(t - last) // 3600} hours ago; nothing to do")
         return
     main = rawrepo.clone_main(["state"])
-    sp = rawrepo.clone_state("state-pulse")
+    rf = rawrepo.clone_state("state-refresh")        # the walk table (stats/refresh.py)
     api = Api(workers=4)
     api.set_budget(BUDGET)
     authed = True
@@ -102,7 +102,7 @@ def run() -> None:
     if not complete:
         cut.append("lists")
     for name, fn in (("categories", lambda: refresh.poll_categories(api, st, t) if authed else None),
-                     ("held", lambda: follow_up_held(api, st, sp, t) if authed else None)):
+                     ("held", lambda: follow_up_held(api, st, rf, t) if authed else None)):
         try:
             fn()
         except OutOfTime:
@@ -110,8 +110,7 @@ def run() -> None:
         except ApiDown as exc:
             print(f"[probe] {name} skipped: {exc}")
     rawrepo.push_state("state-probe", f"probe {time.strftime('%Y-%m-%d %H:%M', time.gmtime(t))}")
-    print(f"[probe] done in {now() - t}s, {api.n_served} answers, {api.n_limited} refusals"
-          + (f", cut: {', '.join(cut)}" if cut else ""))
+    print(f"[probe] done in {now() - t}s, {api.summary()}" + (f", cut: {', '.join(cut)}" if cut else ""))
 
 
 if __name__ == "__main__":

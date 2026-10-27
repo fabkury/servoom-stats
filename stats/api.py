@@ -30,6 +30,12 @@ RETRY_CAP = 60.0
 BUDGET = int(os.environ.get("API_BUDGET", "30"))
 WINDOW = float(os.environ.get("API_WINDOW_SECONDS", "62"))      # a little over the server's 60
 LIMITED_WAIT = WINDOW          # after a refusal the client stops for a whole window
+# Adaptive pacing (2026-10-27). Jobs on different runners can share one egress address,
+# or the server may count by account as well as by address, so a client that holds the
+# full budget keeps colliding and loses half of its requests. After a refusal the client
+# halves its rate (up to SLOWDOWN_MAX times slower); every clean window afterwards
+# restores half of the lost speed.
+SLOWDOWN_MAX = float(os.environ.get("API_SLOWDOWN_MAX", "8"))
 
 # Files come from a different host that has not shown a limit; they are paced apart.
 FILE_INTERVAL = float(os.environ.get("API_FILE_INTERVAL", "0.25"))
@@ -73,6 +79,10 @@ class Api:
         self.n_files = 0
         self._last_ok = time.monotonic()
         self.deadline: Optional[float] = None
+        self.slowdown = 1.0            # current factor on the interval between requests
+        self.slowdown_peak = 1.0       # the worst factor reached during this run
+        self._resume = 0.0             # when the hold after the last refusal ends
+        self._last_adjust = time.monotonic()
 
     def set_budget(self, seconds: float) -> None:
         """Requests sent after ``seconds`` from now raise OutOfTime instead."""
@@ -88,9 +98,31 @@ class Api:
             t = max(now, self._next)
             if self.deadline is not None and t > self.deadline:
                 raise OutOfTime("reading budget spent")
-            self._next = t + self.interval
+            self._next = t + self.interval * self.slowdown
         if t > now:
             time.sleep(t - now)
+
+    def _slow_down(self) -> None:
+        """A refusal: halve the rate. Refusals that other workers meet during the same
+        hold count as the same burst and do not halve it again. Recovery is measured
+        from the end of the hold, so the slower rate holds for at least a window."""
+        with self._lock:
+            now = time.monotonic()
+            if now >= self._resume:
+                self.slowdown = min(self.slowdown * 2, SLOWDOWN_MAX)
+                self.slowdown_peak = max(self.slowdown_peak, self.slowdown)
+            self._resume = now + LIMITED_WAIT
+            self._last_adjust = self._resume
+
+    def _recover(self) -> None:
+        """A served answer: after a whole clean window, restore half of the lost speed."""
+        if self.slowdown == 1.0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            if now - self._last_adjust >= WINDOW:
+                self.slowdown = max(1.0, self.slowdown / 2)
+                self._last_adjust = now
 
     def _hold(self, seconds: float) -> None:
         """Stop every worker for ``seconds``: the next request of any of them waits."""
@@ -119,9 +151,11 @@ class Api:
                     if time.monotonic() - t0 > OUTAGE:
                         raise ApiDown(f"{cmd}: rate-limited for {OUTAGE:.0f}s")
                     self._hold(LIMITED_WAIT)
+                    self._slow_down()
                     continue
                 self._last_ok = time.monotonic()
                 self.n_served += 1
+                self._recover()
                 return data
             except (requests.RequestException, ValueError) as exc:
                 t = time.monotonic()
@@ -156,6 +190,13 @@ class Api:
                 pass
             time.sleep(2 ** attempt)
         return None
+
+    def summary(self) -> str:
+        """``N answers, M refusals`` plus the peak slow-down when there was one."""
+        out = f"{self.n_served} answers, {self.n_limited} refusals"
+        if self.slowdown_peak > 1:
+            out += f", paced down to 1/{self.slowdown_peak:g} at worst"
+        return out
 
     def pmap(self, fn: Callable, items: Iterable) -> List:
         items = list(items)

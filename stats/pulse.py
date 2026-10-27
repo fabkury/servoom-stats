@@ -1,14 +1,14 @@
-"""Hourly pulse: counters for every upload of the past 30 days, new artwork ids,
-the Popular ordering, and who gave each new like. Every fourth hour it also runs the
-refresh, which polls a few slow sources and rebuilds ``data/pulse``.
+"""Hourly pulse: counters for every upload of the past 30 days, the Popular ordering,
+and who gave each new like.
 
 Since Divoom's budget of 30 requests a minute (2026-10-23) a pulse reads for at most
 BUDGET seconds: the window listings come first, then the feeds, then the re-reads of
-omitted artworks, the like lists, the id walk and the refresh. What the budget cuts is
-left out of the hour and logged (``skipped`` in the run log), and the health lanes
-show the hour as degraded for that reason. The daily look-ahead over every list, the
-category totals and the review follow-up moved to stats/probe.py, which has its own
-runner and so its own budget.
+omitted artworks, then the like lists. What the budget cuts is left out of the hour and
+logged (``skipped`` in the run log), and the health lanes show the hour as degraded for
+that reason. Two other jobs have their own runner, and so their own budget: the daily
+look-ahead over every list, the category totals and the review follow-up are in
+stats/probe.py; the id walk, the comment and sign-up polls and the rebuild of
+``data/pulse`` are in stats/refresh.py, which the workflow runs right after this job.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import health, rawrepo, refresh
+from . import health, rawrepo
 from .accounts import Halted, Pool, flush_issues
 from .api import Api, ApiDown, OutOfTime
 from .util import (ALL_SIZES, CATEGORIES, DAY, PHOTO, SIZES, add_rollup, env_flag, is_auto, load_ranges,
@@ -32,9 +32,10 @@ pd.set_option("future.no_silent_downcasting", True)
 WINDOW_DAYS = int(os.environ.get("PULSE_DAYS", "30"))
 AGE_BANDS = [0, 1, 3, 7, 14, 31]
 MIN_GAP = 50 * 60              # a pulse is skipped when the previous one is younger than this
-REFRESH_EVERY = 3.75 * 3600    # the site data is rebuilt by the first pulse after this long
-BUDGET = int(os.environ.get("PULSE_BUDGET_SECONDS", str(48 * 60)))   # reading time per run
-REFRESH_MIN_LEFT = 4 * 60      # the refresh waits for the next hour when less is left
+# Reading time per run. The refresh job follows on another runner and must end before
+# the next pulse starts (refresh.py), so the hour is shared: 44 minutes here leave it
+# about 12 minutes, enough for the id walk, the comments and the sign-up sample.
+BUDGET = int(os.environ.get("PULSE_BUDGET_SECONDS", str(44 * 60)))
 POPULAR_CATS = [3, 6, 8, 12, 1, 4]
 CARRY = ["first_seen", "t_new", "t_rec", "lp", "la", "cmt_ref", "miss"]
 
@@ -80,8 +81,9 @@ def crawl_window(api: Api, st: Path, t: int, cutoff: int, probe: dict):
 
 
 def apply_probe(st: Path, pr: Path) -> dict:
-    """Take over what the daily probe left on its branch: the category totals and the
-    outcome of held uploads; returns its list survey."""
+    """Take over what the daily probe left on its branch: the category totals; returns
+    its list survey. (The outcome of held uploads is applied to the walk table by the
+    refresh job, which owns it.)"""
     out = {}
     f = pr / "lists.json"
     if f.exists():
@@ -91,14 +93,6 @@ def apply_probe(st: Path, pr: Path) -> dict:
         newer = not mine.exists() or json.loads(c.read_text())["log"][-1:] != json.loads(mine.read_text())["log"][-1:]
         if newer:
             mine.write_text(c.read_text())
-    h = read_parquet(pr / "held.parquet")
-    w = read_parquet(st / "walk.parquet")
-    if h is not None and len(h) and w is not None and len(w):
-        res = h.drop_duplicates("gid", keep="last").set_index("gid")
-        idx = w.gid.isin(res.index) & w.t_res.isna()
-        w.loc[idx, "chk_final"] = w.loc[idx, "gid"].map(res.chk_final).to_numpy()
-        w.loc[idx, "t_res"] = w.loc[idx, "gid"].map(res.t_res).to_numpy()
-        write_parquet(w, st / "walk.parquet")
     return out
 
 
@@ -167,37 +161,6 @@ def like_events(api: Api, d: pd.DataFrame, t: int, authed: bool) -> pd.DataFrame
     return out.astype({"gid": "int64", "liker": "int64", "t": "int64", "t_prev": "int64"})
 
 
-def id_walk(api: Api, st: Path, listed: set, t: int, authed: bool) -> pd.DataFrame:
-    """Read every artwork id issued since the last pulse, listed or not."""
-    cols = ["gid", "t", "date", "priv", "isdel", "chk", "listed"]
-    wf = st / "walk.json"
-    state = json.loads(wf.read_text()) if wf.exists() else {}
-    if not authed or not listed:
-        return pd.DataFrame(columns=cols)
-    frontier = state.get("frontier") or max(listed)
-    rows, misses, g = [], 0, frontier + 1
-    while misses < 24 and g - frontier < 1200:
-        batch = list(range(g, g + 8))
-        for gid, r in zip(batch, api.pmap(api.gallery_info, batch)):
-            if r.get("ReturnCode") != 0:
-                misses += 1
-                continue
-            misses = 0
-            priv = int(r.get("PrivateFlag") or 0)
-            date = int(r.get("Date") or 0)
-            if priv:                       # private upload: count it, keep nothing else
-                date = date // 3600 * 3600
-            rows.append((gid, t, date, priv, int(r.get("IsDel") or 0), int(r.get("CheckConfirm") or 0),
-                         int(gid in listed)))
-        g += 8
-    if rows:
-        state["frontier"] = max(r[0] for r in rows)
-    elif "frontier" not in state:
-        state["frontier"] = frontier
-    wf.write_text(json.dumps(state))
-    return pd.DataFrame(rows, columns=cols)
-
-
 def run() -> None:
     t = now()
     hour = t // 3600 * 3600
@@ -207,7 +170,7 @@ def run() -> None:
     # a fallback) because any one of them can be late or dropped. Only the first does work.
     lp = st / "last_pulse.json"
     age = t - json.loads(lp.read_text())["t"] if lp.exists() else None
-    if age is not None and age < MIN_GAP and not (env_flag("FORCE_PULSE") or env_flag("FORCE_REFRESH")):
+    if age is not None and age < MIN_GAP and not env_flag("FORCE_PULSE"):
         print(f"[pulse] the last pulse was {age // 60} minutes ago; nothing to do")
         return
     main = rawrepo.clone_main(["state"])
@@ -327,13 +290,6 @@ def run() -> None:
                 rec=("rec", "max"), new=("new", "max"), lp0=("lp0", "first"), la0=("la0", "first"))
         write_parquet(g[g.last_t > t - 90 * DAY], st / "popular.parquet")
 
-    walk = phase("walk", lambda: id_walk(api, st, set(cur.gid), t, authed), pd.DataFrame(
-        columns=["gid", "t", "date", "priv", "isdel", "chk", "listed"]))
-    if len(walk):
-        w = read_parquet(st / "walk.parquet")
-        w = pd.concat(([w] if w is not None else []) + [walk.assign(chk_final=np.nan, t_res=np.nan)], ignore_index=True)
-        write_parquet(w[w.t > t - 45 * DAY].drop_duplicates("gid"), st / "walk.parquet")
-
     # -- raw observations ---------------------------------------------------
     obs = main / "obs" / "pulse" / time.strftime("%Y/%m/%d", time.gmtime(t))
     hh = time.strftime("%H%M", time.gmtime(t))
@@ -343,8 +299,6 @@ def run() -> None:
         write_parquet(ev, obs / f"{hh}-likes.parquet")
     if len(popular):
         write_parquet(popular[["lst", "rank", "gid", "t"]], obs / f"{hh}-popular.parquet")
-    if len(walk):
-        write_parquet(walk, obs / f"{hh}-walk.parquet")
 
     # -- window state -------------------------------------------------------
     keep = list(cur.columns) + CARRY
@@ -360,39 +314,14 @@ def run() -> None:
     (st / "last_pulse.json").write_text(json.dumps(meta))
     print(f"[pulse] {meta}")
 
-    lr = st / "last_refresh.json"
-    refresh_age = t - json.loads(lr.read_text())["t"] if lr.exists() else None
-    refreshed = 0                       # 1 the refresh ran, -1 it failed, 0 not due this hour
-    due = refresh_age is None or refresh_age > REFRESH_EVERY or env_flag("FORCE_REFRESH") or bootstrap
-    if due and api.seconds_left is not None and api.seconds_left < REFRESH_MIN_LEFT:
-        skipped.append("refresh")           # the next hour runs it; the lane tolerates 6 h
-        print("[pulse] out of time before the refresh")
-    elif due:
-        try:
-            refresh.run(api, st, main, win, t, authed)
-            refreshed = 1
-            spent("refresh")
-        except Exception as exc:  # a failed refresh must not lose the pulse
-            refreshed = -1
-            print(f"[refresh] failed: {exc!r}")
-            if env_flag("STRICT"):
-                raise
     # one row per run, the evidence the health lanes are built from (stats/health.py)
     health.log_run(st, {"t": t, "hour": hour, "mode": meta["mode"], "requests": api.n_requests, "limited": api.n_limited,
-                        "n_window": meta["n_window"], "n_listed": meta["n_listed"], "seconds": now() - t, "refresh": refreshed,
+                        "n_window": meta["n_window"], "n_listed": meta["n_listed"], "seconds": now() - t,
                         "skipped": ",".join(skipped), "served": api.n_served})
-    if refreshed:                       # with the refresh, so the site is rebuilt every 4 hours, not hourly
-        try:
-            health.build_pulse(st, t)
-        except Exception as exc:
-            print(f"[health] failed: {exc!r}")
-            if env_flag("STRICT"):
-                raise
     rawrepo.push_state("state-pulse", f"pulse {time.strftime('%Y-%m-%d %H:%M', time.gmtime(t))}")
     rawrepo.push_main(f"pulse {time.strftime('%Y-%m-%d %H', time.gmtime(t))}")
     flush_issues(Path("_issues"))
-    print(f"[pulse] done in {now() - t}s, {api.n_served} answers, {api.n_limited} refusals"
-          + (f", cut: {', '.join(skipped)}" if skipped else ""))
+    print(f"[pulse] done in {now() - t}s, {api.summary()}" + (f", cut: {', '.join(skipped)}" if skipped else ""))
 
 
 if __name__ == "__main__":

@@ -14,11 +14,17 @@ build downloads `data/` from here. The design is documented in
 
 | Job | When | What it does |
 |-----|------|--------------|
-| `pulse` | hourly | Reads every upload of the past 30 days, new artwork ids, the Popular ordering, and who gave each new like. About 700 requests; once a day about 4,500, when every list is read with a long look-ahead. |
-| refresh | every 4 hours, inside the pulse | Adds new-account sampling, new comments and category totals, then rebuilds `data/pulse/`. |
+| `pulse` | hourly, 44 minutes of reading | Reads every upload of the past 30 days, the Popular ordering, and who gave each new like. About 1,300 requests, all its budget allows. |
+| `refresh` | right after each pulse, on its own runner, until 2.5 minutes before the next pulse | Reads new artwork ids (the walk, which counts private and held uploads too), new comments and a sample of new accounts; every 4 hours it rebuilds `data/pulse/` and the pulse health lanes whether or not those reads fit. About 300 requests. |
+| `probe` | daily | Reads every list with a long look-ahead, the category totals and the outcome of held uploads. About 3,000 requests. |
 | `snapshot` | every two days | Reads the whole public catalog (about 1.5 million artworks), new files, vanished artworks and featured-artist profiles, then rebuilds `data/daily/`. About 66,000 requests, roughly 3.5 hours. The crawl is checkpointed to the raw repository every 20 minutes, and a run started within 6 hours of a failed one resumes from the checkpoint. |
 
 Each job commits `data/` when it changed and asks Cloudflare to rebuild the site.
+
+Divoom serves one source 30 requests a minute (since 2026-10-23). Every job reads within
+a time budget and logs what the budget cut; the pulse and the refresh run one after the
+other so they never share the minute, and the client slows itself down after a refusal
+(`stats/api.py`) in case two runners share an address.
 
 Every run also appends one row to `runs.parquet` on its state branch, and `stats/health.py`
 turns the run logs and the rollups into `data/health/*.json`: for each collector (hourly
@@ -32,9 +38,9 @@ shows the whole history on the overview page. Nothing in it is written by hand:
 
 GitHub's own schedule for Actions proved unreliable (one scheduled run in the first eight
 hours), so a small Cloudflare Worker in [`worker/`](worker/) starts the workflows through
-the `workflow_dispatch` API: the pulse at :17 every hour and the snapshot at 05:43 UTC.
-The workflows keep cron lines at other minutes as a fallback. A pulse exits at once when
-the previous one is under 40 minutes old, and a snapshot when the previous one is under
+the `workflow_dispatch` API: the pulse at :17 every hour, the probe at 02:27 UTC and the
+snapshot at 05:43 UTC. The workflows keep cron lines at other minutes as a fallback. A
+pulse exits at once when the previous one is under 50 minutes old, and a snapshot when the previous one is under
 36 hours old (the catalog is read every two days, to halve the load on each polling
 account), so extra triggers cost a few seconds.
 
@@ -53,7 +59,8 @@ stats/api.py        throttled access to the Divoom API
 stats/accounts.py   polling account pool: token reuse, health checks, rotation, capped registration
 stats/rawrepo.py    git plumbing for the private raw-data repository
 stats/pulse.py      hourly job
-stats/refresh.py    4-hour polling and data/pulse/*.json
+stats/refresh.py    the job after each pulse: id walk, comments, sign-ups, data/pulse/*.json
+stats/probe.py      daily job: list survey, category totals, held uploads
 stats/snapshot.py   whole-catalog job, every two days
 stats/daily.py      data/daily/*.json
 stats/files.py      artwork file features and hashes, avatars
@@ -85,8 +92,9 @@ avatar disappear at the next daily run.
 pip install -r requirements.txt -r requirements-snapshot.txt
 set RAW_REPO_URL=https://github.com/<you>/<your-raw-repo>.git
 python -m stats.pulse        # PULSE_DAYS=1 for a quick run
+python -m stats.refresh      # REFRESH_BUDGET_SECONDS=120 for a quick run
 python -m stats.snapshot     # LIMIT_LISTS=16_1,5_4 to read only a few lists
 ```
 
-`FORCE_REFRESH=1` makes a pulse rebuild `data/pulse/`; `STRICT=1` turns skipped parts
-into errors.
+`FORCE_REFRESH=1` makes the refresh rebuild `data/pulse/` at once; `STRICT=1` turns skipped
+parts into errors.

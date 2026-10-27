@@ -124,7 +124,7 @@ def crawl(api: Api, col: Collector, lists: list, seed: Optional[pd.DataFrame] = 
         done = i + 1
         if i % 10 == 0:
             print(f"[snapshot] list {i}/{len(lists)}, {len(rows) + sum(map(len, frames))} rows, "
-                  f"{api.n_served} answers, {api.n_limited} refusals, {now() - t0}s", flush=True)
+                  f"{api.summary()}, {now() - t0}s", flush=True)
         if save is not None and done < len(lists) and now() - t_save >= CHECKPOINT_EVERY:
             if rows:
                 frames.append(pd.DataFrame(rows, columns=INT))
@@ -520,7 +520,7 @@ def run_crawl(shard: int) -> None:
     save_checkpoint(cur, col, len(lists), len(lists), shard, extra={"events": ev, "comments": cm},
                     info_extra={"enrich_partial": int(partial), "requests": api.n_requests})
     print(f"[snapshot] shard {shard} done: {len(cur)} artworks, {len(ev)} like events, {len(cm)} comments, "
-          f"{api.n_served} answers, {api.n_limited} refusals" + (", enrichment cut by the budget" if partial else ""))
+          f"{api.summary()}" + (", enrichment cut by the budget" if partial else ""))
 
 
 def run_finish() -> None:

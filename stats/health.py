@@ -19,8 +19,9 @@ period than usual); ``missing`` (no reading). ``why`` names the evidence:
 * ``skipped``: parts of the snapshot failed (``parts`` names them).
 
 Output: ``data/health/pulse.json`` (lanes ``pulse`` and ``refresh``, written by the
-4-hour refresh) and ``data/health/snapshot.json`` (lanes ``snapshot`` and ``catalog``,
-written by the snapshot). A span is ``{a, b, level, why, ...}`` with ``a``/``b`` in
+refresh job every 4 hours from the pulse's run log and its own) and
+``data/health/snapshot.json`` (lanes ``snapshot`` and ``catalog``, written by the
+snapshot). A span is ``{a, b, level, why, ...}`` with ``a``/``b`` in
 unix seconds; the spans of a lane are contiguous and ordered.
 """
 
@@ -86,8 +87,16 @@ def timeline(times: List[int], unit: int, tol: int) -> List[Dict]:
 
 
 # ---- hourly job -------------------------------------------------------------
-def pulse_lane(st: Path) -> List[Dict]:
-    """One span per hour slot from the first reading to the last, from the hourly rollup."""
+def _runs(*dirs: Path) -> Optional[pd.DataFrame]:
+    """The run logs of several jobs, together."""
+    parts = [r for r in (read_parquet(d / "runs.parquet") for d in dirs) if r is not None and len(r)]
+    return pd.concat(parts, ignore_index=True) if parts else None
+
+
+def pulse_lane(st: Path, rf: Optional[Path] = None) -> List[Dict]:
+    """One span per hour slot from the first reading to the last, from the hourly rollup.
+    ``st`` is the pulse's branch, ``rf`` the refresh job's: the parts its budget cut
+    (walk, comments, sign-ups) also mark the hour."""
     h = read_parquet(st / "hourly.parquet", columns=["hour", "n", "dt"])
     if h is None or not len(h):
         return []
@@ -98,9 +107,11 @@ def pulse_lane(st: Path) -> List[Dict]:
     runs = read_parquet(st / "runs.parquet")
     no_token = set(runs[runs["mode"] == "degraded"].hour.astype(int)) if runs is not None and "mode" in runs else set()
     cut: Dict[int, str] = {}
-    if runs is not None and "skipped" in runs:
-        for r in runs[runs.skipped.fillna("") != ""].itertuples():
-            cut[int(r.hour)] = str(r.skipped)
+    both = _runs(st, rf) if rf is not None else runs
+    if both is not None and "skipped" in both:
+        for r in both[both.skipped.fillna("") != ""].itertuples():
+            hr = int(r.hour)
+            cut[hr] = ",".join(sorted(set(filter(None, (cut.get(hr, "") + "," + str(r.skipped)).split(",")))))
     spans = []
     for hr in range(int(g.index.min()), int(g.index.max()) + HOUR, HOUR):
         s = {"a": hr, "b": hr + HOUR}
@@ -122,21 +133,23 @@ def pulse_lane(st: Path) -> List[Dict]:
     return merge(spans)
 
 
-def refresh_lane(st: Path) -> List[Dict]:
-    """Spans from the times the 4-hour refresh ran: the run log, plus the seed of refreshes
-    before the log existed (taken from the data commits of this repository)."""
+def refresh_lane(st: Path, rf: Optional[Path] = None) -> List[Dict]:
+    """Spans from the times the 4-hour rebuild ran: the refresh job's run log (``rf``), the
+    pulse's (``st``, which held the rebuild until 2026-10-27), plus the seed of rebuilds
+    before the logs existed (taken from the data commits of this repository)."""
     times: List[int] = []
     seed = CONFIG / "health_seed.json"
     if seed.exists():
         times += json.loads(seed.read_text())["refresh"]
-    runs = read_parquet(st / "runs.parquet")
+    runs = _runs(st, rf) if rf is not None else read_parquet(st / "runs.parquet")
     if runs is not None and "refresh" in runs:
         times += runs[runs.refresh == 1].t.astype(int).tolist()
     return timeline(times, REFRESH_EVERY, REFRESH_TOL)
 
 
-def build_pulse(st: Path, t: int) -> None:
-    lanes = {"pulse": pulse_lane(st), "refresh": refresh_lane(st)}
+def build_pulse(st: Path, rf: Path, t: int) -> None:
+    """``st`` is the pulse's state branch, ``rf`` the refresh job's."""
+    lanes = {"pulse": pulse_lane(st, rf), "refresh": refresh_lane(st, rf)}
     write_json("pulse.json", {"schema": SCHEMA, "generated": iso(t), "lanes": lanes}, SUB)
     print(f"[health] pulse lanes: {', '.join(f'{k} {len(v)} spans' for k, v in lanes.items())}")
 
