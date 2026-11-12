@@ -109,8 +109,8 @@ def crawl(api: Api, col: Collector, lists: list, seed: Optional[pd.DataFrame] = 
     """Read ``lists[start:]``; ``seed`` holds the raw rows of the lists before ``start``.
     Returns (rows, done, complete): the raw rows read, how many lists are finished, and
     whether that is all of them. With ``save``, the raw rows are checkpointed every
-    CHECKPOINT_EVERY seconds. The reading budget ending stops the crawl at a list
-    boundary; the lists after it wait for the next run.
+    CHECKPOINT_EVERY seconds. The reading budget ending, or a server outage, stops the
+    crawl at a list boundary; the lists after it wait for the next run.
     """
     frames = [seed] if seed is not None and len(seed) else []
     rows, t0, t_save, done = [], now(), now(), start
@@ -120,6 +120,9 @@ def crawl(api: Api, col: Collector, lists: list, seed: Optional[pd.DataFrame] = 
             rows += api.crawl_list(cls, size, transform=col.take)
         except OutOfTime:
             print(f"[snapshot] out of time at list {i}/{len(lists)}", flush=True)
+            break
+        except ApiDown as exc:               # an outage ends the run like the budget does
+            print(f"::warning::[snapshot] server outage at list {i}/{len(lists)}: {exc}", flush=True)
             break
         done = i + 1
         if i % 10 == 0:
@@ -451,7 +454,9 @@ def enrich(api: Api, cur: pd.DataFrame, st: Path, main: Path, t: int, since: int
     try:
         salt = (main / "state" / "salt.txt").read_text().strip()
         cm = fetch_comments(api, m, t, since, salt, cap=COMMENTS // SHARDS)
-    except OutOfTime:
+    except ApiDown as exc:                   # the budget ended, or the server is out
+        if not isinstance(exc, OutOfTime):
+            print(f"::warning::[snapshot] server outage while reading comments: {exc}", flush=True)
         cm, partial = empty_cm, True
     return ev, cm, partial
 
